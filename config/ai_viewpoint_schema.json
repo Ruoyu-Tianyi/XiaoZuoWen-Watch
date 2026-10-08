@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["topics"],
+  "properties": {
+    "topics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["topic_id", "viewpoints", "ignored_blocks", "source", "abstain_reason"],
+        "properties": {
+          "topic_id": { "type": "string" },
+          "viewpoints": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["ordinal", "source_block_ordinals", "summary", "evidence", "viewpoint_type", "confidence", "entities", "unresolved_entities"],
+              "properties": {
+                "ordinal": { "type": "integer", "minimum": 1 },
+                "source_block_ordinals": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "integer", "minimum": 1 }
+                },
+                "summary": { "type": "string" },
+                "evidence": { "type": "string" },
+                "viewpoint_type": { "type": "string", "enum": ["company", "industry", "macro", "event", "other"] },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                "entities": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["surface", "canonical_name", "code", "market", "direction", "target_price", "target_currency", "evidence", "confidence"],
+                    "properties": {
+                      "surface": { "type": "string" },
+                      "canonical_name": { "type": "string" },
+                      "code": { "type": "string" },
+                      "market": { "type": "string", "enum": ["SH", "SZ", "BJ", "HK", "US"] },
+                      "direction": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                      "target_price": { "type": ["number", "null"] },
+                      "target_currency": { "type": "string" },
+                      "evidence": { "type": "string" },
+                      "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                    }
+                  }
+                },
+                "unresolved_entities": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["surface", "canonical_name", "direction", "evidence", "confidence", "search_query", "reason"],
+                    "properties": {
+                      "surface": { "type": "string" },
+                      "canonical_name": { "type": "string" },
+                      "direction": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                      "evidence": { "type": "string" },
+                      "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+                      "search_query": { "type": "string" },
+                      "reason": { "type": "string" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "ignored_blocks": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["ordinal", "reason"],
+              "properties": {
+                "ordinal": { "type": "integer", "minimum": 1 },
+                "reason": { "type": "string" }
+              }
+            }
+          },
+          "source": {
+            "anyOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["broker", "team", "evidence", "confidence"],
+                "properties": {
+                  "broker": { "type": "string" },
+                  "team": { "type": "string" },
+                  "evidence": { "type": "string" },
+                  "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                }
+              }
+            ]
+          },
+          "abstain_reason": { "type": "string" }
+        }
+      }
+    }
+  }
+}

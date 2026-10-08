@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>券商小作文 · 信号看板</title>
+  <meta name="description" content="券商小作文结构化入库与研究信号看板">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="page-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <div class="brand-mark"><img src="/assets/bullish-pencil-mark.png" alt="上涨趋势图标"></div>
+        <div><div class="eyebrow">LOCAL RESEARCH SIGNALS</div><h1>券商小作文</h1></div>
+      </div>
+      <div class="header-actions">
+        <div class="freshness" id="freshness">正在读取数据库...</div>
+        <nav class="view-switch" aria-label="页面导航">
+          <button class="view-button active" data-view="dashboard" type="button">信号看板</button>
+          <button class="view-button" data-view="workflow" type="button">入库管理</button>
+        </nav>
+      </div>
+    </header>
+
+    <main id="dashboardView">
+      <section class="hero-row">
+        <div><div class="section-kicker">即时卖方观点追踪</div><h2>哪些标的正在被密集提及？</h2><p>只统计已经人工发布的明确方向观点，同一篇小作文对同一标的只计一次。</p></div>
+        <div class="window-tabs" role="tablist" aria-label="统计时间窗口">
+          <button class="window-tab active" data-window="24" role="tab">24小时</button>
+          <button class="window-tab" data-window="72" role="tab">72小时</button>
+          <button class="window-tab" data-window="168" role="tab">7天</button>
+        </div>
+      </section>
+      <div class="notice hidden" id="notice"></div>
+      <section class="kpi-grid" id="kpiGrid" aria-label="核心指标"></section>
+      <section class="dashboard-grid">
+        <article class="panel trend-panel">
+          <div class="panel-heading"><div><div class="panel-kicker">MENTION FLOW</div><h3>提及趋势</h3></div><div class="legend" aria-label="图例"><span><i class="legend-dot bullish"></i>看多</span><span><i class="legend-dot bearish"></i>看空</span></div></div>
+          <div class="trend-chart" id="trendChart" aria-label="提及趋势堆叠柱状图"></div>
+        </article>
+        <article class="panel quality-panel">
+          <div class="panel-heading"><div><div class="panel-kicker">DATA TRUST · ALL TIME</div><h3>累计发布记录完整性</h3></div><span class="quality-badge" id="qualityBadge">检查中</span></div>
+          <div class="quality-content" id="qualityContent"></div>
+        </article>
+      </section>
+      <section class="panel ranking-panel">
+        <div class="ranking-header">
+          <div><div class="panel-kicker">SECURITY HEAT · TOP 50</div><h3>标的热度排行</h3></div>
+          <div class="filters">
+            <label class="search-box"><span>⌕</span><input id="searchInput" type="search" placeholder="搜索标的或代码" autocomplete="off"></label>
+            <select id="directionSelect" aria-label="观点方向"><option value="">全部方向</option><option value="bullish">仅看多</option><option value="bearish">仅看空</option></select>
+            <select id="brokerSelect" aria-label="券商来源"><option value="">全部券商</option></select>
+          </div>
+        </div>
+        <div class="table-wrap"><table><thead><tr><th>排名</th><th>标的</th><th>热度</th><th>提及</th><th>看多</th><th>看空</th><th>最近提及</th><th></th></tr></thead><tbody id="rankingBody"></tbody></table></div>
+        <div class="empty-state hidden" id="emptyState">暂无已发布观点，或当前筛选条件下没有匹配标的。</div>
+      </section>
+      <section class="panel history-panel">
+        <div class="history-header">
+          <div><div class="panel-kicker">PUBLISHED ARCHIVE</div><h3>历史小作文搜索</h3><p>按标的名称或标准代码检索已发布观点。</p></div>
+          <label class="search-box history-search"><span>⌕</span><input id="historySearchInput" type="search" placeholder="输入标的或代码，如 天孚通信 / 300394.SZ" autocomplete="off"></label>
+        </div>
+        <div class="history-results" id="historyResults"><div class="history-prompt">输入标的名称或代码开始检索。</div></div>
+      </section>
+    </main>
+
+    <main id="workflowView" class="hidden workflow-view">
+      <section class="workflow-hero">
+        <div><div class="section-kicker">增量处理 · 预算可控</div><h2>入库工作流</h2><p>抓取最近7天原文，只处理新增或变更文本。AI完成识别与裁决，仅疑难内容转人工；正式发布仍由你确认。</p></div>
+        <button class="primary-action" id="runAutomationButton" type="button">一键增量入库</button>
+      </section>
+      <div class="notice hidden" id="workflowNotice"></div>
+      <section class="workflow-counts" id="workflowCounts"></section>
+      <section class="panel workflow-control-panel">
+        <div class="workflow-section-header"><div><div class="panel-kicker">RUN CENTER</div><h3>运行中心</h3></div><div class="runtime-state" id="runtimeState">空闲</div></div>
+        <div class="automation-budgets">
+          <label>最多处理篇数<input id="budgetLimit" type="number" min="1" max="10000" value="100"></label>
+          <label>模型调用总上限<input id="budgetCalls" type="number" min="1" max="1000" value="20"></label>
+          <label>输入字符总上限<input id="budgetChars" type="number" min="1" max="10000000" value="120000"></label>
+          <label>累计运行分钟上限<input id="budgetMinutes" type="number" min="1" max="1440" value="30"></label>
+        </div>
+        <p class="automation-hint">上方预算仅用于新批次。续跑严格沿用原批次范围和累计预算，不清零、不自动提高上限。预算耗尽后保留进度，需另行明确调整额度。CLI调用记录不是美元账单。</p>
+        <div class="automation-controls"><label><input id="skipFetch" type="checkbox"> 仅处理本地已有内容，不抓取</label><button id="resumeAutomationButton" type="button" disabled>继续未完成批次</button><button id="stopAutomationButton" type="button" disabled>安全暂停</button></div>
+        <div id="automationProgress" class="automation-progress" aria-live="polite">正在读取批次状态…</div>
+        <details class="legacy-actions"><summary>本批次模型调用明细（最近12次）</summary><div id="automationCallHistory"></div></details>
+        <div class="batch-publish-controls"><label for="publishBatchSelect">手动发布批次</label><select id="publishBatchSelect"><option value="">暂无批次</option></select><button class="publish-button" id="publishBatchButton" type="button" disabled>发布本批次已通过观点</button><span id="publishBatchSummary"></span></div>
+        <details class="legacy-actions"><summary>实验与维护工具（旧试跑，不是完整入库）</summary>
+        <div class="workflow-actions">
+          <button data-action="fetch" type="button"><strong>抓取最近7天</strong><span>原文入库并记录附件排除</span></button>
+          <button data-action="sync-securities" type="button"><strong>同步Tushare</strong><span>更新 SH / SZ / BJ / HK 证券主表</span></button>
+          <button data-action="classify-pilot" type="button"><strong>分类150篇</strong><span>召回率优先的三分类</span></button>
+          <button data-action="extract-pilot" type="button"><strong>抽取观点</strong><span>只保存标的和明确方向</span></button>
+          <button data-action="approve-pilot" type="button"><strong>AI独立二审</strong><span>一致结果自动接受，疑点转人工</span></button>
+          <button data-action="validate" type="button"><strong>运行门禁</strong><span>检查证据、代码和重复观点</span></button>
+        </div>
+        </details>
+      </section>
+      <section class="panel review-panel">
+        <div class="workflow-section-header"><div><div class="panel-kicker">REVIEW CENTER</div><h3>原文与观点管理</h3></div><div class="review-tools"><select id="reviewStatus" aria-label="原文或观点状态"><option value="candidate">待复核</option><option value="reviewed">已接受（未发布）</option><option value="published">正式发布</option><option value="rejected">已排除 / 驳回</option><option value="raw">全部原文（含跳过）</option><option value="all">全部处理结果</option></select><button id="reloadReview" type="button">刷新</button><button class="publish-button" id="publishButton" type="button">检查并发布已接受观点</button></div></div>
+        <div class="review-pagination"><button id="reviewPrevious" type="button">上一页</button><span id="reviewPageSummary" aria-live="polite"></span><button id="reviewNext" type="button">下一页</button></div>
+        <div class="review-list" id="reviewList"><div class="history-prompt">完成试跑后，这里会显示原文与模型结果。</div></div>
+      </section>
+      <section class="workflow-lower-grid">
+        <article class="panel log-panel"><div class="workflow-section-header"><div><div class="panel-kicker">LEGACY RUN HISTORY</div><h3>历史试跑运行（旧流程）</h3></div></div><div id="runHistory"></div></article>
+        <article class="panel log-panel"><div class="workflow-section-header"><div><div class="panel-kicker">LEGACY MODEL HISTORY</div><h3>历史试跑模型记录</h3><p class="automation-hint">不是本批次调用账单；当前实际调用请看运行中心。</p></div></div><div id="modelHistory"></div></article>
+      </section>
+    </main>
+
+    <footer><span>数据源：知识星球「⭕短评&信息(可接ai)」与 Tushare Pro</span><span>结构化结果仅用于研究信息整理，不构成投资建议。</span></footer>
+  </div>
+
+  <div class="drawer-backdrop hidden" id="drawerBackdrop"></div>
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-label="标的详情"><button class="drawer-close" id="drawerClose" aria-label="关闭详情">×</button><div id="drawerContent"></div></aside>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

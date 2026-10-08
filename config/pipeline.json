@@ -1,0 +1,75 @@
+{
+  "pipeline_version": "pipeline-v1",
+  "rules": {
+    "ingestion": "ingestion-v3-pure-text-only",
+    "entity": "entity-v3-market-standard",
+    "direction": "direction-v2",
+    "source": "source-v1",
+    "target": "target-v1"
+  },
+  "entity": {
+    "aliases": [
+      { "alias": "宁王", "code": "300750", "market": "SZ" },
+      { "alias": "茅台", "code": "600519", "market": "SH" },
+      { "alias": "腾讯", "code": "00700", "market": "HK", "reject_following": "会议|文档|链接" },
+      { "alias": "阿里", "code": "09988", "market": "HK", "reject_following": "云盘|文档" },
+      { "alias": "小米", "code": "01810", "market": "HK" }
+    ]
+  },
+  "ingestion": {
+    "incremental": true,
+    "content_policy": "pure_text_only",
+    "fingerprint_fields": ["title", "content"],
+    "attachments": {
+      "policy": "metadata_only",
+      "extract_text": false,
+      "reason": "星球附件图片多数为 emoji 或装饰信息，不参与小作文结构化抽取"
+    }
+  },
+  "direction": {
+    "positive_regex": [
+      "(?:重点|持续|继续|首次|核心|强烈)?推荐",
+      "首推",
+      "维持.{0,8}(?:买入|增持|推荐)",
+      "上调.{0,8}评级",
+      "买入评级",
+      "增持评级",
+      "(?:建议|重点|持续|继续|密切)?关注",
+      "看好",
+      "受益标的",
+      "相关标的",
+      "高弹性",
+      "弹性(?:标的|品种|方向|首选|较大|突出)",
+      "目标价",
+      "上看",
+      "看到",
+      "景气",
+      "超预期",
+      "利润.{0,8}增长",
+      "业绩.{0,8}增长",
+      "迎来.{0,8}拐点",
+      "估值修复",
+      "订单.{0,8}(?:爆发|增长)"
+    ],
+    "negative_regex": [
+      "看空",
+      "卖出评级",
+      "减持评级",
+      "下调.{0,8}评级",
+      "建议.{0,8}回避",
+      "风险较大",
+      "显著低于预期",
+      "盈利下修",
+      "业绩下修",
+      "目标价下调"
+    ],
+    "candidate_reclassify_mode": "promote_neutral"
+  },
+  "quality_gates": {
+    "golden_pass_rate": 1,
+    "golden_entity_pass_rate": 1,
+    "golden_ingestion_pass_rate": 1,
+    "max_direction_change_ratio": 0.35,
+    "allow_coverage_warning": true
+  }
+}

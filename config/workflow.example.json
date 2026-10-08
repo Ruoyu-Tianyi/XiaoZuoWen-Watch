@@ -1,0 +1,69 @@
+{
+  "workflow_version": "broker-note-v2",
+  "window_hours": 168,
+  "group_id": "",
+  "model": {
+    "provider": "claude",
+    "model_id": "claude-cli-default",
+    "claude_cli_path": "claude",
+    "context_size": 16384,
+    "temperature": 0,
+    "classification_prompt_version": "broker-note-classifier-v2",
+    "extraction_prompt_version": "atomic-viewpoint-extractor-v2"
+  },
+  "classification": {
+    "labels": [
+      "broker_note",
+      "not_broker_note",
+      "uncertain"
+    ],
+    "recall_first": true,
+    "extract_labels": [
+      "broker_note",
+      "uncertain"
+    ]
+  },
+  "pilot": {
+    "size": 150,
+    "likely_broker_notes": 100,
+    "obvious_non_notes": 25,
+    "boundary_cases": 25
+  },
+  "automation": {
+    "model": {
+      "provider": "codex",
+      "model": "gpt-5.6-luna"
+    },
+    "review_model": {
+      "provider": "codex",
+      "model": "gpt-5.6-luna"
+    },
+    "limit": 100,
+    "max_calls": 20,
+    "max_input_chars": 120000,
+    "max_minutes": 30,
+    "batch_size": 3,
+    "batch_chars": 12000,
+    "max_attempts": 2,
+    "timeout_ms": 180000,
+    "auto_publish": false
+  },
+  "quality_gates": {
+    "max_obvious_broker_note_misses": 0,
+    "json_success_rate": 1,
+    "evidence_match_rate": 1,
+    "security_accuracy_target": 0.97,
+    "direction_accuracy_target": 0.95,
+    "forbid_inferred_broker": true
+  },
+  "tushare": {
+    "credential_zip": "",
+    "markets": [
+      "SH",
+      "SZ",
+      "BJ",
+      "HK"
+    ],
+    "refresh_hours": 24
+  }
+}

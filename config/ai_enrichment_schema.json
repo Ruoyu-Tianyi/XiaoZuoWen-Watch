@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["topics"],
+  "properties": {
+    "topics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["topic_id", "mentions", "source", "suspected_false_positive_codes", "abstain_reason"],
+        "properties": {
+          "topic_id": { "type": "string" },
+          "mentions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["surface", "canonical_name", "code", "market", "direction", "target_price", "target_currency", "evidence", "confidence"],
+              "properties": {
+                "surface": { "type": "string" },
+                "canonical_name": { "type": "string" },
+                "code": { "type": "string" },
+                "market": { "type": "string", "enum": ["SH", "SZ", "BJ", "HK", "US"] },
+                "direction": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                "target_price": { "type": ["number", "null"] },
+                "target_currency": { "type": "string" },
+                "evidence": { "type": "string" },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          },
+          "source": {
+            "anyOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["broker", "team", "evidence", "confidence"],
+                "properties": {
+                  "broker": { "type": "string" },
+                  "team": { "type": "string" },
+                  "evidence": { "type": "string" },
+                  "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                }
+              }
+            ]
+          },
+          "suspected_false_positive_codes": { "type": "array", "items": { "type": "string" } },
+          "abstain_reason": { "type": "string" }
+        }
+      }
+    }
+  }
+}

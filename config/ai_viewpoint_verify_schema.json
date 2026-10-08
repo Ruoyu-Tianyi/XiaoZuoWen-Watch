@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["topics"],
+  "properties": {
+    "topics": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["topic_id", "entities", "unresolved_entities", "source", "abstain_reason"],
+        "properties": {
+          "topic_id": { "type": "string" },
+          "entities": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["surface", "canonical_name", "code", "market", "direction", "evidence", "confidence"],
+              "properties": {
+                "surface": { "type": "string" },
+                "canonical_name": { "type": "string" },
+                "code": { "type": "string" },
+                "market": { "type": "string", "enum": ["SH", "SZ", "BJ", "HK", "US"] },
+                "direction": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                "evidence": { "type": "string" },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          },
+          "unresolved_entities": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["surface", "canonical_name", "direction", "evidence", "confidence"],
+              "properties": {
+                "surface": { "type": "string" },
+                "canonical_name": { "type": "string" },
+                "direction": { "type": "string", "enum": ["bullish", "bearish", "neutral"] },
+                "evidence": { "type": "string" },
+                "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+              }
+            }
+          },
+          "source": {
+            "anyOf": [
+              { "type": "null" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["broker", "team", "evidence", "confidence"],
+                "properties": {
+                  "broker": { "type": "string" },
+                  "team": { "type": "string" },
+                  "evidence": { "type": "string" },
+                  "confidence": { "type": "number", "minimum": 0, "maximum": 1 }
+                }
+              }
+            ]
+          },
+          "abstain_reason": { "type": "string" }
+        }
+      }
+    }
+  }
+}

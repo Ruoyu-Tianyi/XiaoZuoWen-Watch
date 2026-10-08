@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "resolutions": [
+    {
+      "canonical_name": "特斯拉",
+      "code": "TSLA",
+      "market": "US",
+      "aliases": ["Tesla", "Tesla, Inc.", "特斯拉"],
+      "source": "Tesla Investor Relations",
+      "url": "https://ir.tesla.com/contact-us",
+      "notes": "Tesla 官方投资者关系页确认其股票在 Nasdaq 以 TSLA 交易。"
+    },
+    {
+      "canonical_name": "Alphabet（谷歌）",
+      "code": "GOOGL",
+      "market": "US",
+      "aliases": ["Alphabet", "Alphabet Inc.", "Google", "谷歌"],
+      "source": "Alphabet Investor Relations",
+      "url": "https://abc.xyz/",
+      "notes": "Alphabet 官方页面确认其股票在 Nasdaq 以 GOOGL 和 GOOG 交易；本库以 GOOGL 作为公司级主代码。"
+    },
+    {
+      "canonical_name": "Meta Platforms（Facebook）",
+      "code": "META",
+      "market": "US",
+      "aliases": ["Meta", "Meta Platforms", "Meta Platforms, Inc.", "Facebook", "脸书"],
+      "source": "Meta Investor Relations",
+      "url": "https://investor.atmeta.com/resources/default.aspx",
+      "notes": "Meta 官方投资者关系页确认其股票在 Nasdaq 以 META 交易。"
+    }
+  ]
+}

@@ -1,0 +1,58 @@
+{
+  "name": "broker-note-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "license": "UNLICENSED",
+  "repository": { "type": "git", "url": "git+https://github.com/Ruoyu-Tianyi/XiaoZuoWen-Watch.git" },
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/lib/approval_guard.test.mjs scripts/lib/model_client.test.mjs scripts/lib/note_normalization.test.mjs scripts/lib/automated_pipeline.test.mjs scripts/validate_automated_batch.test.mjs",
+    "workflow:validate-batch": "node scripts/validate_automated_batch.mjs",
+    "workflow:run": "node scripts/automated_workflow.mjs run",
+    "workflow:automation-status": "node scripts/automated_workflow.mjs status",
+    "workflow:stop": "node scripts/automated_workflow.mjs stop",
+    "start": "node app/server.mjs",
+    "refresh": "node scripts/refresh_all.mjs",
+    "pipeline": "node scripts/refresh_all.mjs",
+    "pipeline:init": "node scripts/pipeline_control.mjs init",
+    "extract": "node scripts/pipeline_control.mjs extract",
+    "reprocess": "node scripts/pipeline_control.mjs reprocess",
+    "validate": "node scripts/pipeline_control.mjs validate",
+    "diff": "node scripts/pipeline_control.mjs diff",
+    "publish": "node scripts/pipeline_control.mjs publish",
+    "pipeline:status": "node scripts/pipeline_control.mjs status",
+    "ingest": "node scripts/fetch_recent.mjs",
+    "backfill": "node scripts/backfill_pipeline.mjs",
+    "check": "node scripts/check_data_quality.mjs",
+    "normalize:security-master": "node scripts/normalize_security_master.mjs",
+    "update:bj-security-master": "node scripts/download_bj_security_master.mjs",
+    "update:us-security-master": "node scripts/download_us_security_master.mjs",
+    "enrich:history": "node scripts/enrich_history.mjs run",
+    "enrich:prepare": "node scripts/enrich_history.mjs prepare",
+    "enrich:status": "node scripts/enrich_history.mjs status",
+    "enrich:test": "node --test scripts/lib/ai_enrichment.test.mjs scripts/lib/ai_viewpoint_enrichment.test.mjs",
+    "viewpoints:pilot": "node scripts/enrich_history.mjs run --viewpoints --pilot=300 --batch-topics=6 --batch-chars=16000",
+    "viewpoints:history": "node scripts/enrich_history.mjs run --viewpoints --authoritative --batch-topics=6 --batch-chars=16000",
+    "viewpoints:check": "node scripts/check_viewpoint_enrichment.mjs --write",
+    "viewpoints:resolve": "node scripts/resolve_security_queue.mjs",
+    "workflow:init": "node scripts/workflow.mjs init",
+    "workflow:fetch": "node scripts/workflow.mjs fetch",
+    "workflow:sync-securities": "node scripts/workflow.mjs sync-securities",
+    "workflow:classify": "node scripts/workflow.mjs classify-pilot",
+    "workflow:extract": "node scripts/workflow.mjs extract-pilot --concurrency=2",
+    "workflow:approve": "node scripts/workflow.mjs approve-pilot",
+    "workflow:pilot": "node scripts/workflow.mjs pilot",
+    "workflow:validate": "node scripts/workflow.mjs validate",
+    "workflow:status": "node scripts/workflow.mjs status",
+    "workflow:recover": "node scripts/workflow.mjs recover"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "zsxq-cli": "0.5.0"
+  },
+  "devDependencies": {
+    "@openai/codex": "^0.149.0"
+  }
+}

@@ -1,0 +1,41 @@
+# Dependencies, local runtime data and private research content
+/node_modules/
+/data/
+/reports/
+/.tmp/
+/.tmp-*/
+/logs/
+/outputs/
+/backups/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+*.log
+*.jsonl
+*.zip
+*.tar
+*.gz
+
+# Local configuration, credentials and privately derived evaluation samples
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+auth.json
+credentials.json
+/config/workflow.json
+/config/*.local.*
+/config/golden_*_samples.json
+/.codex/
+/.agents/
+/.aws/
+
+# Historical local notes/reports are retained locally; publish curated docs only
+/docs/*
+!/docs/PROJECT_WORKFLOW.md
+
+.DS_Store
+Thumbs.db
+Desktop.ini

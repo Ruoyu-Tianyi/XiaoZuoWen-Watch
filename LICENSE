@@ -1,0 +1,46 @@
+XiaoZuoWen Watch — Proprietary Rights Notice
+
+Copyright (c) 2026 Tianyi Zhou (GitHub: Ruoyu-Tianyi).
+All rights reserved.
+
+This notice applies to the original project code, documentation, prompts,
+schemas, interface designs and other original materials in this repository
+(the "Project"), to the extent owned by the copyright holder. The Project is
+proprietary software and is not offered under an open-source license.
+
+No license is granted to use, run, reproduce, modify, distribute, sublicense,
+sell, or create derivative works of the Project, for commercial or
+noncommercial purposes, without prior written permission from the copyright
+holder. Public access to this repository does not itself grant such permission.
+
+In particular, no permission is granted to incorporate the Project into a
+product or service, offer a hosted service or SaaS using the Project, sell or
+redistribute the Project, or exploit its original materials commercially.
+
+The copyright holder expressly reserves all commercialization rights in the
+original materials they own, including the rights to develop and operate
+commercial products and services, charge fees, issue separate commercial
+licenses, sublicense, transfer rights, and offer the Project under different
+terms. No exclusivity, patent license, trademark license, or obligation to
+release future versions is granted by publication of this repository.
+
+This notice does not restrict rights that cannot lawfully be restricted, or
+rights to view and fork a public repository expressly granted by GitHub's
+applicable platform terms. Such platform rights do not grant any additional
+right to deploy, redistribute, or commercially exploit the Project.
+
+Third-party software and materials remain governed by their respective
+licenses and rights. This notice neither replaces those licenses nor claims
+ownership of third-party research, securities data, model outputs, trademarks,
+or other materials. See THIRD_PARTY_NOTICES.md.
+
+No rights in private datasets, credentials, or external services are granted.
+Access to those resources requires separate authorization from their owners.
+
+THE PROJECT IS PROVIDED "AS IS", WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND
+NONINFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE
+COPYRIGHT HOLDER IS NOT LIABLE FOR CLAIMS OR DAMAGES ARISING FROM THE PROJECT.
+
+For permissions or commercial licensing, contact Ruoyu-Tianyi through the
+repository owner's GitHub profile: https://github.com/Ruoyu-Tianyi.
