@@ -330,16 +330,17 @@ export function parseCodexEvents(stdout) {
   return { actualModel, usage, error, toolUsed, completed, terminalFailure, warnings };
 }
 
-export async function preflightModel({ provider, model, codexHome, timeoutMs = 15000, probe = spawnCapture, readCatalog } = {}) {
+export async function preflightModel({ provider, model, codexHome, codexCliPath, timeoutMs = 15000, probe = spawnCapture, readCatalog } = {}) {
   if (provider !== 'codex') throw modelError(`当前成本可控入口仅配置 Codex 预检；${provider || '未配置提供方'} 请显式配置后再运行`, 'MODEL_PREFLIGHT_FAILED');
   if (!model || model === 'codex-cli-default') throw modelError('预检要求明确的 Codex 模型 ID，不能使用浮动默认模型', 'MODEL_PREFLIGHT_FAILED');
   const env = codexEnvironment(codexHome);
   const codexJs = resolvePath('node_modules/@openai/codex/bin/codex.js');
+  const command=codexCliPath||process.execPath,prefix=codexCliPath?[]:[codexJs];
   const options = { env, timeoutMs, captureBoth: true };
   let help; let login;
   try {
-    help = await probe(process.execPath, [codexJs, 'exec', '--help'], options);
-    login = await probe(process.execPath, [codexJs, 'login', 'status'], options);
+    help = await probe(command, [...prefix, 'exec', '--help'], options);
+    login = await probe(command, [...prefix, 'login', 'status'], options);
   } catch (error) {
     throw modelError(`Codex 本地预检未通过：${safeErrorText(error.message)}`, 'MODEL_PREFLIGHT_FAILED');
   }
@@ -352,25 +353,27 @@ export async function preflightModel({ provider, model, codexHome, timeoutMs = 1
   try { catalog = readCatalog ? await readCatalog() : JSON.parse(readFileSync(join(env.CODEX_HOME, 'models_cache.json'), 'utf8')); }
   catch { throw modelError('未找到可读的本地模型目录缓存，无法在零模型调用下确认模型可用性', 'MODEL_PREFLIGHT_FAILED'); }
   const models = Array.isArray(catalog) ? catalog : catalog.models || [];
-  if (!models.some((entry) => (typeof entry === 'string' ? entry : entry.slug || entry.id || entry.model) === model)) {
+  const catalogModelListed=models.some((entry) => (typeof entry === 'string' ? entry : entry.slug || entry.id || entry.model) === model);
+  if (!catalogModelListed && !codexCliPath) {
     throw modelError(`本地模型目录未列出 ${model}，本次任务未发起模型调用`, 'MODEL_PREFLIGHT_FAILED');
   }
-  return { verified: true, verification: 'local_cli_login_and_cached_catalog', provider, requestedModel: model,
+  return { verified: true, verification: catalogModelListed?'local_cli_login_and_cached_catalog':'explicit_cli_login_only', catalogModelListed, provider, requestedModel: model,
     actualModel: null, loggedIn: true, catalogFetchedAt: catalog.fetched_at || null,
-    reason: '本地 CLI、ChatGPT 登录及缓存目录已确认；实际服务返回的模型和用量在运行时记录。' };
+    reason: catalogModelListed?'本地 CLI、ChatGPT 登录及缓存目录已确认；实际服务返回的模型和用量在运行时记录。':'显式指定客户端及登录已确认，跨版本共享目录未列出该模型；不保证模型可用，实际调用失败即停止。' };
 }
 
 // Only the process runner is injectable. Tests therefore exercise real argv,
 // temporary output files, JSONL admission and cleanup, not a bypassed adapter.
-export async function callCodex({ model, system, prompt, schema, codexHome, timeoutMs = 300000, codexRunner = spawnCapture }) {
+export async function callCodex({ model, system, prompt, schema, codexHome, codexCliPath, timeoutMs = 300000, codexRunner = spawnCapture }) {
   const tempDir = mkdtempSync(join(tmpdir(), 'broker-note-codex-'));
   const schemaPath = join(tempDir, 'schema.json');
   const outputPath = join(tempDir, 'output.json');
   const codexJs = resolvePath('node_modules/@openai/codex/bin/codex.js');
-  const args = [codexJs, 'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', tempDir,
+  const command=codexCliPath||process.execPath;
+  const args = [...(codexCliPath?[]:[codexJs]), 'exec', '--ephemeral', '--ignore-user-config', '--skip-git-repo-check', '--sandbox', 'read-only', '--cd', tempDir,
     '--output-schema', schemaPath, '--output-last-message', outputPath, '--color', 'never', '--json',
     '-c', 'model_reasoning_effort="low"'];
-  for (const feature of ['shell_tool', 'unified_exec', 'apps', 'plugins', 'browser_use', 'browser_use_external', 'computer_use', 'in_app_browser', 'multi_agent', 'code_mode_host', 'hooks', 'image_generation', 'view_image', 'skill_search', 'unbounded_connection_retries']) args.push('--disable', feature);
+  for (const feature of ['shell_tool', 'unified_exec', 'apps', 'plugins', 'browser_use', 'browser_use_external', 'computer_use', 'in_app_browser', 'multi_agent', ...(codexCliPath?['code_mode','code_mode_only']:['code_mode_host']), 'hooks', 'image_generation', 'view_image', 'skill_search', 'unbounded_connection_retries']) args.push('--disable', feature);
   if (model && model !== 'codex-cli-default') args.push('--model', model);
   args.push('-');
   const started = Date.now();
@@ -379,7 +382,7 @@ export async function callCodex({ model, system, prompt, schema, codexHome, time
     writeFileSync(schemaPath, JSON.stringify(schema), 'utf8');
     let stdout; let processFailure = null;
     try {
-      const captured = await codexRunner(process.execPath, args, { cwd: tempDir, env: codexEnvironment(codexHome), timeoutMs,
+      const captured = await codexRunner(command, args, { cwd: tempDir, env: codexEnvironment(codexHome), timeoutMs,
         input: `${system}\n\n${prompt}\n\n不要调用任何工具；不要读取目录或文件；只根据以上文本输出符合 Schema 的最终 JSON。` });
       stdout = typeof captured === 'string' ? captured : captured?.stdout || '';
     } catch (error) { processFailure = error; stdout = error.stdout || ''; }

@@ -18,6 +18,8 @@ try {
       prepareOnly:process.argv.includes('--prepare-only'),
       compactReview:process.argv.includes('--compact-review'),
       reviewChars:option('review-chars'),
+      model:option('model'),keyedOutput:process.argv.includes('--keyed-output'),chunkLimit:option('chunk-limit'),
+      codexCliPath:option('codex-cli'),
       unlimitedCalls:process.argv.includes('--unlimited-calls')?true:process.argv.includes('--limited-calls')?false:undefined,
       dailyMaxChars:option('max-daily-chars'),concurrency:option('concurrency'),
       autoPublish:process.argv.includes('--auto-publish')?true:process.argv.includes('--no-auto-publish')?false:undefined,

@@ -9,6 +9,28 @@ import { batchModelInputs, callStructuredModel, classificationSchema, classifyMo
 const valid = () => ({ classification: 'broker_note', confidence: 0.94, evidence: '推荐关注', reasons: [], negative_signals: [] });
 const base = { provider: 'codex', model: 'fixed-model', schema: classificationSchema, prompt: '正文', system: '只提取原文' };
 
+test('explicit new CLI may validate login despite stale shared catalog without claiming catalog availability',async()=>{
+  const result=await preflightModel({provider:'codex',model:'new-fixture-model',codexCliPath:'C:/fixture/codex.exe',
+    readCatalog:async()=>({models:['old-fixture-model']}),probe:async(command,args)=>{
+      assert.equal(command,'C:/fixture/codex.exe');
+      return {stdout:args.includes('--help')?'--json --output-schema --ephemeral --ignore-user-config --cd':'Logged in using ChatGPT',stderr:''};
+    }});
+  assert.equal(result.verified,true);assert.equal(result.catalogModelListed,false);
+  assert.equal(result.actualModel,null);assert.equal(result.verification,'explicit_cli_login_only');
+});
+
+test('explicit newer Codex binary uses isolated invocation and rejects tool use exactly like default client',async()=>{
+  const cli=fakeCodexRunner();
+  const result=await callStructuredModel({...base,codexCliPath:'C:/fixture/codex.exe',codexRunner:cli.runner});
+  assert.equal(result.result.classification,'broker_note');
+  assert.equal(cli.calls[0].command,'C:/fixture/codex.exe');
+  assert.equal(cli.calls[0].args[0],'exec');
+  assert.ok(cli.calls[0].args.includes('code_mode'));cli.assertClean();
+  const bad=fakeCodexRunner({events:[{type:'item.completed',item:{type:'mcp_tool_call'}},{type:'turn.completed'}]});
+  await assert.rejects(callStructuredModel({...base,codexCliPath:'C:/fixture/codex.exe',codexRunner:bad.runner}),/工具调用/);
+  bad.assertClean();
+});
+
 test('strict schema checks required fields, types, enum, finite numbers, bounds and extra fields', () => {
   assert.deepEqual(validateStructuredResult(valid(), classificationSchema), valid());
   for (const mutate of [

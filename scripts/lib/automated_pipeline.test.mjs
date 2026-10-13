@@ -64,6 +64,7 @@ function fakeDependencies({ topics = [source()], transform, fetch } = {}) {
         calls.push({ stage, topicIds: inputs.map(item => item.topic_id) });
         let result = { items: inputs.map(item => ({ topic_id: item.topic_id, result: ordinaryResult(item, stage) })) };
         if (transform) result = await transform({ stage, inputs, result, callNumber: calls.length });
+        if(options.schema.properties.results && result.items)result={results:Object.fromEntries(result.items.map(i=>[i.topic_id,i.result]))};
         return { result, actualModel: 'fixture-model', usage: { input_tokens: 100, output_tokens: 50 }, durationMs: 2 };
       },
     }),
@@ -608,6 +609,42 @@ test('explicit unlimited batch bypasses both call caps but does not exempt other
   assert.equal(batchRow(db,unlimited.id).calls_used,45);
   assert.throws(()=>reserveCall(db,normal.id,{stage:'review',provider:'codex',model:'fixture-model',chars:1}),/跨批次模型调用上限/);
   assert.throws(()=>reserveCall(db,unlimited.id,{stage:'review',provider:'codex',model:'fixture-model',chars:600000}),/字符上限/);
+});
+
+test('keyed output requires every exact topic key and prevents duplicate array IDs from being admitted',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies({topics:[source(),source({topic_id:'987654321',content:`${BODY}第二篇`})]});
+  const result=await runAutomatedPipeline(db,opts({keyedOutput:true}),fake.dependencies);
+  assert.equal(result.status,'completed');assert.equal(count(db,'viewpoints'),2);
+  const broken=fakeDependencies({topics:[source({topic_id:'999111222',content:`${BODY}第三篇`}),source({topic_id:'999111333',content:`${BODY}第四篇`})],transform:({result})=>{
+    result.items[1].topic_id=result.items[0].topic_id;return result;
+  }});
+  const rejected=await runAutomatedPipeline(db,opts({keyedOutput:true}),broken.dependencies);
+  assert.equal(rejected.status,'paused');assert.equal(count(db,'viewpoints'),2);
+});
+
+test('explicit model migration preserves completed topics and records transition without resetting usage',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies({topics:[source(),source({topic_id:'987654321',content:`${BODY}第二篇`})]});
+  const first=await runAutomatedPipeline(db,opts({batchSize:1,chunkLimit:1}),fake.dependencies);
+  assert.equal(first.status,'paused');assert.equal(fake.calls.length,2);
+  const preserved=db.prepare('SELECT * FROM viewpoints').get();
+  const resumed=await runAutomatedPipeline(db,{resume:first.batch_id,model:'new-fixture-model',keyedOutput:true},fake.dependencies);
+  assert.equal(resumed.status,'completed',JSON.stringify(resumed));assert.equal(fake.calls.length,4);
+  assert.deepEqual(db.prepare('SELECT * FROM viewpoints WHERE id=?').get(preserved.id),preserved);
+  assert.equal(count(db,'workflow_model_transitions'),1);
+  assert.equal(batchRow(db,first.batch_id).calls_used,4);
+});
+
+test('resume reviews already-paid primary work in parallel without repeating extraction',async t=>{
+  const {db}=fixture(t);let active=0,maxActive=0;
+  const fake=fakeDependencies({topics:Array.from({length:4},(_,i)=>source({topic_id:String(600100000+i),content:`${BODY}并行复核${i}`})),
+    transform:async({stage,result})=>{if(stage==='review'){active++;maxActive=Math.max(maxActive,active);await new Promise(r=>setTimeout(r,15));active--;}return result;}});
+  const first=await runAutomatedPipeline(db,opts({batchSize:4}),{...fake.dependencies,log:e=>{
+    if(e.stage==='primary')db.prepare('UPDATE workflow_batches SET stop_requested=1').run();
+  }});
+  assert.equal(first.status,'paused');assert.equal(fake.calls.length,1);
+  const resumed=await runAutomatedPipeline(db,{resume:first.batch_id,concurrency:4,batchSize:1},fake.dependencies);
+  assert.equal(resumed.status,'completed',JSON.stringify(resumed));assert.equal(maxActive,4);
+  assert.equal(fake.calls.length,5);assert.equal(count(db,'viewpoints'),4);
 });
 
 test('recent entry can explicitly resume an unlimited batch after the usual daily call cap',async t=>{

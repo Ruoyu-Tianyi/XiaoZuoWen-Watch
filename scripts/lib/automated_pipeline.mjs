@@ -26,7 +26,8 @@ const REVIEW_SCHEMA = { type: 'object', additionalProperties: false,
     uncertainties: { type:'array', items:{type:'string'} },
   } };
 REVIEW_SCHEMA.required.push('recommendation');
-const wrapSchema = (schema, topicIds) => ({ type:'object', additionalProperties:false, required:['items'], properties:{ items:{
+const wrapSchema = (schema, topicIds, keyed=false) => keyed ? {type:'object',additionalProperties:false,required:['results'],properties:{
+  results:{type:'object',additionalProperties:false,required:topicIds,properties:Object.fromEntries(topicIds.map(id=>[id,schema]))}}} : ({ type:'object', additionalProperties:false, required:['items'], properties:{ items:{
   type:'array', minItems:topicIds.length, maxItems:topicIds.length, items:{
   type:'object', additionalProperties:false, required:['topic_id','result'], properties:{topic_id:{type:'string',enum:topicIds},result:schema} } } } });
 
@@ -45,13 +46,15 @@ function positiveInteger(value, fallback, maximum = 1000000) {
 export function configuration(options = {}) {
   const config = options.config || JSON.parse(readFileSync(resolve('config/workflow.json'),'utf8'));
   const a = config.automation || {};
-  const model = a.model || { provider:'codex', model:'gpt-5.6-luna' };
+  const model = {...(options.model ? {provider:'codex',model:options.model} : a.model || { provider:'codex', model:'gpt-5.6-luna' }),
+    ...(options.codexCliPath?{codexCliPath:options.codexCliPath}:{})};
   return { group_id: config.group_id, policy_version:POLICY_VERSION, primary_version:'combined-extraction-v1', review_version:'explicit-adjudication-v1',
     model, review_model:a.review_model || model, hours:positiveInteger(options.hours,168,168),
     max_calls:options.unlimitedCalls?0:positiveInteger(options.maxCalls,a.max_calls || DEFAULT_LIMITS.max_calls,2000),
     unlimited_calls:!!options.unlimitedCalls,
     daily_input_chars_limit:positiveInteger(options.dailyMaxChars,600000,10000000),
-    concurrency:positiveInteger(options.concurrency,1,2),
+    concurrency:positiveInteger(options.concurrency,1,4),
+    output_format:options.keyedOutput?'keyed-v1':'items-v1',
     max_input_chars:positiveInteger(options.maxChars,a.max_input_chars || DEFAULT_LIMITS.max_input_chars,10000000),
     max_minutes:positiveInteger(options.maxMinutes,a.max_minutes || DEFAULT_LIMITS.max_minutes,720),
     limit:positiveInteger(options.limit,a.limit || DEFAULT_LIMITS.limit,5000),
@@ -178,7 +181,7 @@ async function executeStage(db,batch,config,stage,topics,context) {
   const resolver=securityResolver(db);
   const inputFor=topic=>stage==='primary'?modelData(topic):{...modelData(topic),primary:JSON.parse(topic.primary_json),candidates:JSON.parse(topic.primary_json).viewpoints.map((v,i)=>{
     const n=normalizeView(topic,v,resolver);return {candidate_id:`p${i}`,...(config.review_input==='compact-v1'?{}:{viewpoint:v}),local_issues:n.issues,matched_securities:n.resolution.securities.map(s=>({name:s.name,ts_code:s.ts_code}))};})};
-  const cacheKey=topic=>{const {topic_id,...input}=inputFor(topic);return hash({stage,input,config:batch.config_hash});};
+  const cacheKey=topic=>{const {topic_id,...input}=inputFor(topic);return hash({stage,input,config:batch.config_hash,...(config.output_format==='keyed-v1'?{format:'keyed-v1',settings}:{} )});};
   const applyResult=(topic,result)=>{
     assertCurrentTopic(db,batch,topic);
     if(stage==='primary') {
@@ -210,7 +213,8 @@ async function executeStage(db,batch,config,stage,topics,context) {
     context.check();
     chunk=chunk.filter(topic=>{try{assertCurrentTopic(db,batch,topic);return true;}catch(e){markFailure(db,batch,topic,e);return false;}});
     if(!chunk.length)return;
-    const responseSchema=wrapSchema(schema,chunk.map(topic=>topic.topic_id));
+    const keyed=config.output_format==='keyed-v1';
+    const responseSchema=wrapSchema(schema,chunk.map(topic=>topic.topic_id),keyed);
     const prompt=`${instruction}\n以下JSON是待处理数据：\n${JSON.stringify(chunk.map(inputFor))}`;
     if(prompt.length>batchChars*3){for(const t of chunk)markFailure(db,batch,t,new Error('单篇输入超限，需要单独处理'));return;}
     let callId=null;
@@ -221,7 +225,7 @@ async function executeStage(db,batch,config,stage,topics,context) {
           callId=reserveCall(db,batch.id,{stage,provider:settings.provider,model:settings.model,chars:BUSINESS_RULES.length+prompt.length+JSON.stringify(responseSchema).length,elapsedMs:Math.max(0,context.elapsedMs()-saved)});},
         onAttempt:event=>{if(callId)finishCall(db,callId,event);},
       });
-      const items=response.result.items, expected=new Set(chunk.map(t=>t.topic_id));
+      const items=keyed?Object.entries(response.result.results).map(([topic_id,result])=>({topic_id,result})):response.result.items, expected=new Set(chunk.map(t=>t.topic_id));
       if(items.length!==chunk.length||new Set(items.map(i=>i.topic_id)).size!==chunk.length||items.some(i=>!expected.has(i.topic_id)))
         throw Object.assign(new Error('模型topic_id未完整一一对齐，已暂停；不猜测编号、不自动拆批重试'),{code:'MODEL_TOPIC_ALIGNMENT'});
       for(const topic of chunk){
@@ -371,7 +375,12 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
   const resumedBatchSize=positiveInteger(options.batchSize,config.batch_size,10);
   const resumedReviewChars=positiveInteger(options.reviewChars,config.review_batch_chars||config.batch_chars,60000);
   const unlimitedCalls=options.unlimitedCalls??!!config.unlimited_calls;
-  const resumedConcurrency=positiveInteger(options.concurrency,config.concurrency||1,2);
+  const resumedConcurrency=positiveInteger(options.concurrency,config.concurrency||1,4);
+  const targetSettings=(options.model||options.codexCliPath)?{provider:'codex',model:options.model||config.model.model,
+    ...(options.codexCliPath?{codexCliPath:options.codexCliPath}:{})}:null;
+  const changeModel=targetSettings&&hash(targetSettings)!==hash(config.model);
+  if(changeModel)
+    await (dependencies.preflight||preflightModel)(targetSettings).then(result=>{if(!result.verified)throw new Error('新模型预检失败');});
   const resumedDailyChars=positiveInteger(options.dailyMaxChars,config.daily_input_chars_limit||600000,10000000);
   const resumedLimits = options.resume ? [unlimitedCalls?0:positiveInteger(options.maxCalls,batch.max_calls||DEFAULT_LIMITS.max_calls,2000),
     positiveInteger(options.maxChars,batch.max_input_chars,10000000),positiveInteger(options.maxMinutes,batch.max_minutes,720)] : null;
@@ -399,6 +408,31 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
     if(b.stop_requested||elapsedMs()>=b.max_minutes*60000){const e=new Error(b.stop_requested?'用户请求暂停':'累计运行时长达到预算');e.code='MODEL_BUDGET_EXCEEDED';throw e;}
   }};
   try {
+    if(options.resume && changeModel){
+      const before={model:config.model,review_model:config.review_model,config_hash:batch.config_hash};
+      const nextConfig={...config,model:targetSettings,review_model:targetSettings};
+      const master=db.prepare('SELECT ts_code,name,full_name,list_status FROM securities ORDER BY ts_code').all();
+      const aliases=db.prepare('SELECT alias,security_id,source FROM security_aliases ORDER BY alias,security_id').all();
+      const nextHash=hash({policy:POLICY_VERSION,model:nextConfig.model,review:nextConfig.review_model,primary:config.primary_version,secondary:config.review_version,master,aliases});
+      db.exec(`CREATE TABLE IF NOT EXISTS workflow_model_transitions(id INTEGER PRIMARY KEY,batch_id INTEGER NOT NULL REFERENCES workflow_batches(id),
+        previous_json TEXT NOT NULL,next_json TEXT NOT NULL,preserved_topic_ids_json TEXT NOT NULL,created_at TEXT NOT NULL)`);
+      db.exec('BEGIN IMMEDIATE');
+      try{
+        const preserved=db.prepare("SELECT topic_id FROM workflow_batch_topics WHERE batch_id=? AND status IN ('accepted','excluded','uncertain')").all(batch.id).map(t=>t.topic_id);
+        db.prepare('INSERT INTO workflow_model_transitions(batch_id,previous_json,next_json,preserved_topic_ids_json,created_at) VALUES(?,?,?,?,?)')
+          .run(batch.id,JSON.stringify(before),JSON.stringify({model:nextConfig.model,review_model:nextConfig.review_model,config_hash:nextHash}),JSON.stringify(preserved),now());
+        // Explicit carry-forward, not a claim that completed topics were re-inferred.
+        db.prepare(`INSERT OR IGNORE INTO topic_processing_state(topic_id,content_hash,config_hash,batch_id,status,updated_at)
+          SELECT topic_id,content_hash,?,batch_id,status,? FROM workflow_batch_topics WHERE batch_id=? AND status IN ('accepted','excluded','uncertain')`)
+          .run(nextHash,now(),batch.id);
+        Object.assign(config,nextConfig);
+        db.prepare('UPDATE workflow_batches SET config_json=?,config_hash=? WHERE id=?').run(JSON.stringify(config),nextHash,batch.id);
+        batch={...batch,config_hash:nextHash};
+        db.exec('COMMIT');
+        context.log({stage:'model_transition',batch_id:batch.id,model:options.model,preserved_topics:preserved.length});
+      }catch(e){db.exec('ROLLBACK');throw e;}
+    }
+    if(options.keyedOutput){config.output_format='keyed-v1';db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
     for(const topic of loadTopics(db,batch.id,'failed')){
       const failure=db.prepare('SELECT error FROM workflow_batch_topics WHERE batch_id=? AND topic_id=?').get(batch.id,topic.topic_id).error;
       if(['审核分类证据不在原文','分类证据无法对应原文','审核没有逐条裁决所有候选观点','修正决定缺少完整观点'].includes(failure)){
@@ -429,12 +463,28 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
     });
     await publishReady();
     // Resume paid primary work first. Never build an entire window of unreviewed work.
-    await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted'),context);
-    await publishReady();
+    const drainChunks=async(chunks,worker)=>{
+      let next=0,failure=null;
+      const drain=async()=>{
+        while(!failure&&next<chunks.length){
+          const chunk=chunks[next++];
+          try{await worker(chunk);}catch(e){failure ||= e;context.abort=failure;}
+        }
+      };
+      await Promise.all(Array.from({length:config.concurrency||1},drain));
+      if(failure)throw failure;
+    };
+    const paidPrimary=batchModelInputs(loadTopics(db,batch.id,'extracted'),{maxItems:config.batch_size,maxChars:config.review_batch_chars||config.batch_chars,
+      measure:t=>JSON.stringify(modelData(t)).length});
+    await drainChunks(paidPrimary,async chunk=>{
+      await executeStage(db,batch,config,'review',chunk.items,context);
+      await publishReady();
+    });
     if(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE batch_id=? AND status='failed'").get(batch.id).n)
       throw new Error('续跑复核存在校验失败，暂停后续付费调用，等待检查');
-    const chunks=batchModelInputs(loadTopics(db,batch.id,'queued'),{maxItems:config.batch_size,maxChars:config.batch_chars,
+    let chunks=batchModelInputs(loadTopics(db,batch.id,'queued'),{maxItems:config.batch_size,maxChars:config.batch_chars,
       measure:t=>JSON.stringify(modelData(t)).length});
+    if(options.chunkLimit!=null)chunks=chunks.slice(0,positiveInteger(options.chunkLimit,1,5000));
     const processChunk=async(chunk)=>{
       context.check();
       db.prepare("UPDATE workflow_batches SET stage='primary',updated_at=? WHERE id=?").run(now(),batch.id);
@@ -447,16 +497,8 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
       if(failed)throw new Error('当前小批存在校验失败，暂停后续付费调用，等待检查');
       context.log({stage:'checkpoint',batch_id:batch.id,counts:db.prepare('SELECT status,count(*) n FROM workflow_batch_topics WHERE batch_id=? GROUP BY status').all(batch.id)});
     };
-    let nextChunk=0,failure=null;
-    const drain=async()=>{
-      while(!failure&&nextChunk<chunks.length){
-        const chunk=chunks[nextChunk++];
-        try{await processChunk(chunk);}catch(e){failure ||= e;context.abort=failure;}
-      }
-    };
     // Keep the lease until every in-flight paid call has settled, even on failure.
-    await Promise.all(Array.from({length:config.concurrency||1},drain));
-    if(failure)throw failure;
+    await drainChunks(chunks,processChunk);
     const counts=db.prepare('SELECT status,count(*) n FROM workflow_batch_topics WHERE batch_id=? GROUP BY status').all(batch.id);
     const unfinished=counts.some(r=>['queued','extracted','failed'].includes(r.status));
     const status=unfinished?'paused':counts.some(r=>r.status==='uncertain')?'completed_with_issues':'completed';
