@@ -3,6 +3,7 @@ import { ensureApprovalSchema } from './approval_guard.mjs';
 
 export const POLICY_VERSION = 'incremental-adjudication-v1';
 export const DEFAULT_LIMITS = { max_calls: 20, max_input_chars: 120000, max_minutes: 30, limit: 100 };
+export const DAILY_LIMITS = { max_calls: 40, max_input_chars: 600000 };
 export const hash = (value) => createHash('sha256').update(typeof value === 'string' ? value : JSON.stringify(value)).digest('hex');
 export const now = () => new Date().toISOString();
 
@@ -55,9 +56,28 @@ export function ensureAutomationSchema(db) {
       evidence_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, resolved_at TEXT
     );
   `);
+  if(!db.prepare('PRAGMA table_info(workflow_batches)').all().some(c=>c.name==='pause_code'))
+    db.exec('ALTER TABLE workflow_batches ADD COLUMN pause_code TEXT');
 }
 
 const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
+export function dailyBudget(db, at = Date.now()) {
+  const day = new Date(Number(at) + 8 * 3600000).toISOString().slice(0, 10);
+  const start = new Date(`${day}T00:00:00+08:00`).toISOString();
+  const end = new Date(Date.parse(start) + 86400000).toISOString();
+  const used = hasTable(db, 'model_call_ledger') ? db.prepare(`SELECT count(*) calls_used,
+    coalesce(sum(input_chars),0) input_chars_used FROM model_call_ledger WHERE started_at>=? AND started_at<?`).get(start,end)
+    : { calls_used: 0, input_chars_used: 0 };
+  return { day, timezone: 'Asia/Shanghai', ...DAILY_LIMITS, ...used,
+    calls_remaining: Math.max(0, DAILY_LIMITS.max_calls-used.calls_used),
+    input_chars_remaining: Math.max(0, DAILY_LIMITS.max_input_chars-used.input_chars_used), resets_at: end };
+}
+
+export function requireReviewCapacity(db, batchId) {
+  const batch = db.prepare('SELECT calls_used,max_calls FROM workflow_batches WHERE id=?').get(batchId);
+  if(batch.max_calls-batch.calls_used<2 || dailyBudget(db).calls_remaining<2)
+    throw Object.assign(new Error('剩余调用预算不足以完成识别和复核，保留待处理内容'), { code:'MODEL_BUDGET_EXCEEDED' });
+}
 export function getAutomationStatus(db) {
   const coverage = hasTable(db, 'raw_topics') ? db.prepare(`SELECT min(published_at_utc) earliest,max(published_at_utc) latest,
     (SELECT max(finished_at) FROM ingestion_runs WHERE status='success') last_fetch_at FROM raw_topics`).get() : {};
@@ -72,8 +92,9 @@ export function getAutomationStatus(db) {
   const pending = hasTable(db, 'topic_processing_state') ? db.prepare(`SELECT count(*) n FROM raw_topics rt
     WHERE eligibility='eligible' AND published_at_utc>=? AND NOT EXISTS(SELECT 1 FROM topic_processing_state p
       WHERE p.topic_id=rt.topic_id AND p.content_hash=rt.content_hash AND p.status IN ('accepted','excluded','uncertain'))`).get(new Date(Date.now() - 168 * 3600000).toISOString()).n : 0;
-  return { batches, latest_batch: batches[0] || null, coverage, pending_recent: pending, defaults: DEFAULT_LIMITS,
-    cost_note: 'CLI 账户额度：显示CLI调用与输入文本量，底层网络重试不可逐次计数，也不是美元账单。预算达到后暂停，续跑不清零。' };
+  const daily=dailyBudget(db);
+  return { batches, latest_batch: batches[0] || null, coverage, pending_recent: pending, defaults: DEFAULT_LIMITS, daily_budget: daily,
+    cost_note: `上海日期 ${daily.day} 全部批次合计：${daily.calls_used}/${daily.max_calls} 次调用、${daily.input_chars_used}/${daily.max_input_chars} 输入字符。CLI内部网络重试不可逐次计数，也不是美元账单。预算达到后暂停，续跑不清零；尚未启用每日定时触发。` };
 }
 
 export function requestBatchStop(db, id) {
@@ -91,7 +112,7 @@ export function acquireBatch(db, id, { isAlive = pid => { try { process.kill(pid
       db.prepare("UPDATE workflow_batches SET status='paused',lease_token=NULL,lease_pid=NULL,error='工作进程退出，可续跑' WHERE id=?").run(b.id);
       db.prepare("UPDATE model_call_ledger SET status='interrupted',finished_at=? WHERE batch_id=? AND status='running'").run(now(), b.id);
     }
-    db.prepare("UPDATE workflow_batches SET status='running',stop_requested=0,error=NULL,lease_token=?,lease_pid=?,heartbeat_at=?,updated_at=? WHERE id=?")
+    db.prepare("UPDATE workflow_batches SET status='running',stop_requested=0,error=NULL,pause_code=NULL,lease_token=?,lease_pid=?,heartbeat_at=?,updated_at=? WHERE id=?")
       .run(token, process.pid, now(), now(), id);
     db.exec('COMMIT');
     return token;
@@ -102,15 +123,19 @@ export function reserveCall(db, batchId, { stage, provider, model, chars, elapse
   db.exec('BEGIN IMMEDIATE');
   try {
     const b = db.prepare('SELECT * FROM workflow_batches WHERE id=?').get(batchId);
+    const stamp=now();
+    const daily = dailyBudget(db,Date.parse(stamp));
     let message = null;
     if (b.stop_requested) message = '用户请求暂停';
+    else if (daily.calls_remaining < 1) message = '已达到上海自然日跨批次模型调用上限';
+    else if (chars > daily.input_chars_remaining) message = '已达到上海自然日跨批次模型输入字符上限';
     else if (b.calls_used >= b.max_calls) message = '已达到本批次模型调用上限';
     else if (b.input_chars_used + chars > b.max_input_chars) message = '已达到本批次模型输入字符上限';
     else if (b.elapsed_ms + elapsedMs >= b.max_minutes * 60000) message = '已达到本批次累计运行时长上限';
     if (message) { const e = new Error(message); e.code = 'MODEL_BUDGET_EXCEEDED'; throw e; }
-    db.prepare('UPDATE workflow_batches SET calls_used=calls_used+1,input_chars_used=input_chars_used+?,updated_at=? WHERE id=?').run(chars, now(), batchId);
+    db.prepare('UPDATE workflow_batches SET calls_used=calls_used+1,input_chars_used=input_chars_used+?,updated_at=? WHERE id=?').run(chars, stamp, batchId);
     const id = Number(db.prepare(`INSERT INTO model_call_ledger(batch_id,stage,provider,requested_model,input_chars,status,started_at)
-      VALUES(?,?,?,?,?,'running',?)`).run(batchId, stage, provider, model, chars, now()).lastInsertRowid);
+      VALUES(?,?,?,?,?,'running',?)`).run(batchId, stage, provider, model, chars, stamp).lastInsertRowid);
     db.exec('COMMIT');
     return id;
   } catch (error) { db.exec('ROLLBACK'); throw error; }

@@ -9,6 +9,7 @@
     "test": "node --test scripts/lib/approval_guard.test.mjs scripts/lib/model_client.test.mjs scripts/lib/note_normalization.test.mjs scripts/lib/automated_pipeline.test.mjs scripts/validate_automated_batch.test.mjs",
     "workflow:validate-batch": "node scripts/validate_automated_batch.mjs",
     "workflow:run": "node scripts/automated_workflow.mjs run",
+    "workflow:recent": "node scripts/automated_workflow.mjs recent",
     "workflow:automation-status": "node scripts/automated_workflow.mjs status",
     "workflow:stop": "node scripts/automated_workflow.mjs stop",
     "start": "node app/server.mjs",

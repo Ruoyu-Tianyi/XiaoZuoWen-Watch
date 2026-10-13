@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { ensureWorkflowSchema } from './workflow_db.mjs';
 import { runAutomatedPipeline, createBatch } from './automated_pipeline.mjs';
-import { acquireBatch, reserveCall, ensureAutomationSchema, hash } from './automation_state.mjs';
+import { runRecentPipeline } from './recent_pipeline.mjs';
+import { acquireBatch, reserveCall, ensureAutomationSchema, hash, dailyBudget, DAILY_LIMITS } from './automation_state.mjs';
 import { callStructuredModel } from './model_client.mjs';
 import { recordApproval, validatePublishBatch, publishAccepted } from './approval_guard.mjs';
 
@@ -105,37 +106,38 @@ test('same-window rerun fetches safely but performs zero new model invocations',
   assert.equal(count(db, 'raw_topics'), 1);
 });
 
-test('budget pause resumes only remaining review and does not reset used budget', async t => {
+test('insufficient paired-call budget stops before spending and explicit resume keeps cumulative limits', async t => {
   const { db } = fixture(t), fake = fakeDependencies();
   const first = await runAutomatedPipeline(db, opts({ maxCalls: 1 }), fake.dependencies);
   assert.equal(first.status, 'paused');
-  assert.equal(topicRow(db, first.batch_id).status, 'extracted');
-  assert.equal(batchRow(db, first.batch_id).calls_used, 1);
+  assert.equal(topicRow(db, first.batch_id).status, 'queued');
+  assert.equal(batchRow(db, first.batch_id).calls_used, 0);
   assert.equal(batchRow(db, first.batch_id).lease_token, null);
   const stillCapped = await runAutomatedPipeline(db, { resume: first.batch_id }, fake.dependencies);
   assert.equal(stillCapped.status, 'paused');
-  assert.equal(fake.calls.length, 1);
+  assert.equal(fake.calls.length, 0);
   const resumed = await runAutomatedPipeline(db, { resume: first.batch_id, maxCalls: 2 }, fake.dependencies);
   assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
   assert.deepEqual(fake.calls.map(call => call.stage), ['primary', 'review']);
   assert.equal(batchRow(db, first.batch_id).calls_used, 2);
 });
 
-test('review evidence failure stays failed and resume does not repeat successful primary', async t => {
+test('review evidence failure is quarantined for humans without repeating paid primary or review', async t => {
   const { db } = fixture(t); let broken = true;
   const fake = fakeDependencies({ transform: ({ stage, result }) => {
     if (stage === 'review' && broken) result.items[0].result.classification_evidence = '原文没有这句';
     return result;
   } });
   const first = await runAutomatedPipeline(db, opts(), fake.dependencies);
-  assert.equal(first.status, 'paused');
-  assert.equal(topicRow(db, first.batch_id).status, 'failed');
+  assert.equal(first.status, 'completed_with_issues');
+  assert.equal(topicRow(db, first.batch_id).status, 'uncertain');
   assert.equal(count(db, 'viewpoints'), 0);
-  assert.equal(count(db, 'topic_processing_state'), 0);
+  assert.equal(count(db, 'topic_processing_state'), 1);
   broken = false;
   const resumed = await runAutomatedPipeline(db, { resume: first.batch_id }, fake.dependencies);
-  assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
-  assert.deepEqual(fake.calls.map(call => call.stage), ['primary', 'review', 'review']);
+  assert.equal(resumed.status, 'completed_with_issues', JSON.stringify(resumed));
+  assert.deepEqual(fake.calls.map(call => call.stage), ['primary', 'review']);
+  assert.equal(count(db,'workflow_topic_issues'),1);
 });
 
 test('non-broker text retains original but ends excluded with no structured viewpoints', async t => {
@@ -231,10 +233,10 @@ test('malformed primary schema and fabricated classification evidence fail close
         return result;
       } });
       const run = await runAutomatedPipeline(db, opts(), fake.dependencies);
-      assert.equal(run.status, 'paused');
-      assert.equal(topicRow(db, run.batch_id).status, 'failed');
+      assert.equal(run.status, mode==='schema'?'paused':'completed_with_issues');
+      assert.equal(topicRow(db, run.batch_id).status, mode==='schema'?'failed':'uncertain');
       assert.equal(count(db, 'viewpoints'), 0);
-      assert.equal(count(db, 'topic_processing_state'), 0);
+      assert.equal(count(db, 'topic_processing_state'), mode==='schema'?0:1);
       assert.equal(count(db, 'workflow_model_cache'), 0);
     });
   }
@@ -394,7 +396,9 @@ function mutateOriginal(db, content) {
 
 test('resume rejects a changed current original before spending on a stale-version review', async t => {
   const { db } = fixture(t), fake = fakeDependencies();
-  const first = await runAutomatedPipeline(db, opts({ maxCalls: 1 }), fake.dependencies);
+  const first = await runAutomatedPipeline(db, opts(), {...fake.dependencies,log:event=>{
+    if(event.stage==='primary')db.prepare('UPDATE workflow_batches SET stop_requested=1').run();
+  }});
   assert.equal(first.status, 'paused');
   mutateOriginal(db, `${BODY}后续说明：推荐逻辑已经变化。`);
   const resumed = await runAutomatedPipeline(db, { resume: first.batch_id, maxCalls: 3 }, fake.dependencies);
@@ -403,6 +407,158 @@ test('resume rejects a changed current original before spending on a stale-versi
   assert.equal(topicRow(db, first.batch_id).status, 'failed');
   assert.equal(count(db, 'viewpoints'), 0);
   assert.equal(count(db, 'topic_processing_state'), 0);
+});
+
+test('small chunks finish review before new primary work and reserve the last call', async t => {
+  const { db } = fixture(t), fake = fakeDependencies({topics:Array.from({length:7},(_,i)=>source({
+    topic_id:String(700000000+i),content:`${BODY}样本${i}。`} ))});
+  const first=await runAutomatedPipeline(db,opts({maxCalls:3}),fake.dependencies);
+  assert.equal(first.status,'paused');
+  assert.deepEqual(fake.calls.map(c=>c.stage),['primary','review']);
+  assert.equal(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE status='accepted'").get().n,3);
+  assert.equal(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE status='extracted'").get().n,0);
+  const resumed=await runAutomatedPipeline(db,{resume:first.batch_id,maxCalls:6},fake.dependencies);
+  assert.equal(resumed.status,'completed',JSON.stringify(resumed));
+  assert.deepEqual(fake.calls.map(c=>c.stage),['primary','review','primary','review','primary','review']);
+  assert.equal(count(db,'viewpoints'),7);
+});
+
+test('prepare-only saves the full window without probing or calling a model',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies();
+  const prepared=await runAutomatedPipeline(db,opts({prepareOnly:true}),fake.dependencies);
+  assert.equal(prepared.status,'prepared');assert.equal(prepared.selected_count,1);
+  assert.equal(fake.calls.length,0);assert.equal(fake.preflights.length,0);
+  const resumed=await runAutomatedPipeline(db,{resume:prepared.batch_id},fake.dependencies);
+  assert.equal(resumed.status,'completed');assert.equal(fake.fetches.length,1);
+});
+
+test('temporary fetch errors retry the same cursor, but authentication failure never retries',async t=>{
+  const {db}=fixture(t);
+  const fake=fakeDependencies({fetch:({number})=>{
+    if(number<3)throw new Error('connectex: connection attempt timed out');
+    return {topics_brief:[source()],has_more:false,next_end_time:null};
+  }});
+  const delays=[];
+  const result=await runAutomatedPipeline(db,opts({prepareOnly:true}),{...fake.dependencies,sleep:async ms=>delays.push(ms)});
+  assert.equal(result.status,'prepared');assert.deepEqual(delays,[1000,2000]);
+  assert.deepEqual(fake.fetches.map(f=>f.cursor),[null,null,null]);assert.equal(fake.calls.length,0);
+  const auth=fakeDependencies({fetch:()=>{throw new Error('401 unauthorized connection timeout');}});
+  const rejected=await runAutomatedPipeline(db,opts(),{...auth.dependencies,sleep:()=>assert.fail('no auth retries')});
+  assert.equal(rejected.status,'paused');assert.equal(auth.fetches.length,1);assert.equal(auth.calls.length,0);
+});
+
+test('one invalid evidence topic is isolated while unrelated chunks continue automatically',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies({topics:Array.from({length:4},(_,i)=>source({topic_id:String(800000000+i),content:`${BODY}样本${i}`})),
+    transform:({stage,result})=>{if(stage==='review'&&result.items.some(i=>i.topic_id==='800000000'))
+      result.items.find(i=>i.topic_id==='800000000').result.classification_evidence='伪造原文证据';return result;}});
+  const result=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  assert.equal(result.status,'completed_with_issues');
+  assert.deepEqual(fake.calls.map(c=>c.stage),['primary','review','primary','review']);
+  assert.equal(count(db,'viewpoints'),3);
+  assert.equal(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE status='uncertain'").get().n,1);
+  assert.equal(db.prepare("SELECT count(*) n FROM workflow_model_cache WHERE stage='review'").get().n,3);
+});
+
+test('legacy failed evidence output is quarantined on resume without paying again',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies();
+  const first=await runAutomatedPipeline(db,opts({prepareOnly:true}),fake.dependencies);
+  db.prepare("UPDATE workflow_batch_topics SET status='failed',error='审核分类证据不在原文' WHERE batch_id=?").run(first.batch_id);
+  const result=await runAutomatedPipeline(db,{resume:first.batch_id},fake.dependencies);
+  assert.equal(result.status,'completed_with_issues');
+  assert.equal(fake.calls.length,0);assert.equal(count(db,'workflow_topic_issues'),1);
+});
+
+test('compact review keeps complete primary viewpoints without duplicated candidate copies',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies({transform:({stage,inputs,result})=>{
+    if(stage==='review')for(const item of inputs){
+      assert.equal(item.primary.viewpoints.length,1);
+      assert.equal(Object.hasOwn(item.candidates[0],'viewpoint'),false);
+      assert.equal(item.candidates[0].candidate_id,'p0');
+    }
+    return result;
+  }});
+  const result=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  assert.equal(result.status,'completed');
+  assert.match(db.prepare("SELECT prompt_version FROM workflow_model_cache WHERE stage='review'").get().prompt_version,/compact-input-v1/);
+});
+
+test('review uses its own character grouping instead of fragmenting on primary input limits',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies({topics:Array.from({length:3},(_,i)=>source({topic_id:String(900000000+i),content:`${BODY}样本${i}`}))});
+  const options=opts();options.config.automation.batch_chars=500;
+  options.config.automation.review_batch_chars=40000;
+  const result=await runAutomatedPipeline(db,options,fake.dependencies);
+  assert.equal(result.status,'completed',JSON.stringify(result));
+  assert.deepEqual(fake.calls.map(c=>[c.stage,c.topicIds.length]),[['primary',3],['review',3]]);
+});
+
+test('Shanghai daily budget counts failed calls across batches and cannot be reset by a new batch',t=>{
+  const {db}=fixture(t),first=createBatch(db,opts()),second=createBatch(db,opts());
+  db.prepare('UPDATE workflow_batches SET max_calls=100').run();
+  for(let i=0;i<DAILY_LIMITS.max_calls;i++){
+    const id=reserveCall(db,i%2?first.id:second.id,{stage:'primary',provider:'codex',model:'fixture-model',chars:100});
+    db.prepare("UPDATE model_call_ledger SET status='failed' WHERE id=?").run(id);
+  }
+  const third=createBatch(db,opts());
+  assert.equal(dailyBudget(db).calls_remaining,0);
+  assert.throws(()=>reserveCall(db,third.id,{stage:'review',provider:'codex',model:'fixture-model',chars:1}),/跨批次模型调用上限/);
+  assert.equal(batchRow(db,third.id).calls_used,0);
+  const boundary=Date.parse('2026-10-12T16:00:00Z');
+  assert.equal(dailyBudget(db,boundary-1).day,'2026-10-12');
+  assert.equal(dailyBudget(db,boundary).day,'2026-10-13');
+});
+
+test('daily input character cap is atomic and independent of per-batch caps',t=>{
+  const {db}=fixture(t),first=createBatch(db,opts()),second=createBatch(db,opts());
+  db.prepare('UPDATE workflow_batches SET max_input_chars=1000000').run();
+  reserveCall(db,first.id,{stage:'primary',provider:'codex',model:'fixture-model',chars:DAILY_LIMITS.max_input_chars});
+  assert.throws(()=>reserveCall(db,second.id,{stage:'review',provider:'codex',model:'fixture-model',chars:1}),/跨批次模型输入字符上限/);
+  assert.equal(batchRow(db,second.id).calls_used,0);
+});
+
+test('recent entry resumes prepared window automatically and keeps full-window selection',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies();
+  const prepared=await runAutomatedPipeline(db,opts({prepareOnly:true}),fake.dependencies);
+  const result=await runRecentPipeline(db,{windowEnd:WINDOW_END,maxCalls:4},fake.dependencies);
+  assert.equal(result.batch_id,prepared.batch_id);
+  assert.equal(result.status,'completed');
+  assert.equal(fake.fetches.length,1);
+  assert.equal(batchRow(db,result.batch_id).calls_used,2);
+});
+
+test('recent entry refuses automatic retry of a structural failure or manual stop',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies({transform:({result})=>{result.items[0].topic_id='999';return result;}});
+  const first=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  const calls=fake.calls.length;
+  const result=await runRecentPipeline(db,{windowEnd:WINDOW_END},fake.dependencies);
+  assert.equal(result.status,'paused');assert.equal(fake.calls.length,calls);
+  db.prepare("UPDATE workflow_batches SET pause_code='MODEL_BUDGET_EXCEEDED',stop_requested=1 WHERE id=?").run(first.batch_id);
+  const stopped=await runRecentPipeline(db,{windowEnd:WINDOW_END},fake.dependencies);
+  assert.match(stopped.error,/人为停止/);assert.equal(fake.calls.length,calls);
+});
+
+test('recent entry does not reset daily cap or create batches while daily budget is empty',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies(),batch=createBatch(db,opts());
+  db.prepare('UPDATE workflow_batches SET max_calls=100').run();
+  for(let i=0;i<DAILY_LIMITS.max_calls;i++)reserveCall(db,batch.id,{stage:'primary',provider:'codex',model:'fixture-model',chars:1});
+  const before=count(db,'workflow_batches');
+  const result=await runRecentPipeline(db,{windowEnd:WINDOW_END},fake.dependencies);
+  assert.equal(result.status,'paused');assert.equal(fake.calls.length,0);
+  assert.equal(count(db,'workflow_batches'),before);
+});
+
+test('recent next-day continuation raises only cumulative operational caps, never resets recorded use',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies();
+  const prepared=await runAutomatedPipeline(db,opts({prepareOnly:true}),fake.dependencies);
+  db.prepare("UPDATE workflow_batches SET calls_used=40,max_calls=40,input_chars_used=4000,elapsed_ms=300000,pause_code='MODEL_BUDGET_EXCEEDED' WHERE id=?").run(prepared.batch_id);
+  const yesterday=new Date(Date.now()-86400000).toISOString();
+  for(let i=0;i<40;i++)db.prepare("INSERT INTO model_call_ledger(batch_id,stage,provider,requested_model,input_chars,status,started_at) VALUES(?,'primary','codex','fixture-model',100,'failed',?)").run(prepared.batch_id,yesterday);
+  const result=await runRecentPipeline(db,{windowEnd:WINDOW_END,maxCalls:2,maxChars:80000,maxMinutes:10},fake.dependencies);
+  assert.equal(result.status,'completed');
+  const saved=batchRow(db,prepared.batch_id);
+  assert.equal(saved.calls_used,42);assert.equal(saved.max_calls,42);
+  assert.equal(count(db,'model_call_ledger'),42);
+  assert.ok(saved.input_chars_used>4000);assert.equal(saved.max_input_chars,84000);
+  assert.equal(saved.max_minutes,15);
 });
 
 test('current original changed during review cannot create accepted records or a reusable review cache', async t => {

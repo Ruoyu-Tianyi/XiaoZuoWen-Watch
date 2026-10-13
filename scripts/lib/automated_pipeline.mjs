@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { getZsxqCommand } from './zsxq_command.mjs';
 import { callStructuredModel, classificationSchema, extractionSchema, batchModelInputs, preflightModel, classifyModelError } from './model_client.mjs';
-import { hash, now, POLICY_VERSION, DEFAULT_LIMITS, ensureAutomationSchema, acquireBatch, reserveCall, finishCall, finishTopic, getAutomationStatus } from './automation_state.mjs';
+import { hash, now, POLICY_VERSION, DEFAULT_LIMITS, ensureAutomationSchema, acquireBatch, reserveCall, finishCall, finishTopic, requireReviewCapacity } from './automation_state.mjs';
 import { originalEvidence, readableText, sourceText, securityResolver, normalizeView, normalizeSource, normalizeName } from './note_normalization.mjs';
 import { recordApproval, validatePublishBatch } from './approval_guard.mjs';
 
@@ -52,8 +52,10 @@ export function configuration(options = {}) {
     max_minutes:positiveInteger(options.maxMinutes,a.max_minutes || DEFAULT_LIMITS.max_minutes,720),
     limit:positiveInteger(options.limit,a.limit || DEFAULT_LIMITS.limit,5000),
     batch_size:positiveInteger(options.batchSize,a.batch_size || 3,10), batch_chars:positiveInteger(a.batch_chars,12000,60000),
+    review_batch_chars:positiveInteger(options.reviewChars,a.review_batch_chars || 40000,60000),
     max_attempts:positiveInteger(a.max_attempts,2,3), timeout_ms:positiveInteger(a.timeout_ms,180000,600000),
     skip_fetch:!!options.skipFetch, reconcile:!!options.reconcile,
+    review_input: 'compact-v1',
   };
 }
 
@@ -82,6 +84,20 @@ function fetchPage(groupId, cursor) {
     child.on('close',code=>{clearTimeout(timer);if(code!==0)return reject(new Error((err||out||`星球退出码${code}`).slice(-1500)));
       try{const p=JSON.parse(out.slice(out.indexOf('{')));if(!Array.isArray(p.topics_brief))throw new Error('星球分页缺少topics_brief');resolvePage(p);}catch(e){reject(e);}});
   });
+}
+
+async function fetchWithRetry(groupId,cursor,context,dependencies) {
+  for(let attempt=1;attempt<=3;attempt++){
+    context.check();
+    try{return await (dependencies.fetchPage||fetchPage)(groupId,cursor);}
+    catch(error){
+      const transient=/超时|timeout|connectex|connection (?:reset|refused|attempt|timed out)|ECONNRESET|ETIMEDOUT|EAI_AGAIN/i.test(error.message);
+      const auth=/401|403|unauthori[sz]ed|forbidden|未登录|登录过期/i.test(error.message);
+      if(attempt===3||!transient||auth)throw error;
+      context.log({stage:'fetch_retry',attempt,cursor,reason:'临时连接故障，保留同一游标重试'});
+      await (dependencies.sleep||((ms)=>new Promise(r=>setTimeout(r,ms))))(attempt*1000);
+    }
+  }
 }
 
 export function ingestPage(db, batch, page) {
@@ -124,8 +140,8 @@ function selectTopics(db,batch,config) {
   const scope=config.reconcile
     ? `AND EXISTS(SELECT 1 FROM pilot_samples ps WHERE ps.topic_id=rt.topic_id) AND EXISTS(SELECT 1 FROM viewpoints v WHERE v.topic_id=rt.topic_id AND v.review_status IN ('candidate','reviewed'))`
     : 'AND rt.published_at_utc>=? AND rt.published_at_utc<=?';
-  const args=config.reconcile?[]:[batch.window_start,batch.window_end];
-  const topics=db.prepare(`SELECT rt.* FROM raw_topics rt WHERE eligibility='eligible' ${scope}
+  const args=[config.group_id,...(config.reconcile?[]:[batch.window_start,batch.window_end])];
+  const topics=db.prepare(`SELECT rt.* FROM raw_topics rt WHERE eligibility='eligible' AND rt.group_id=? ${scope}
     AND NOT EXISTS(SELECT 1 FROM topic_processing_state p WHERE p.topic_id=rt.topic_id AND p.content_hash=rt.content_hash AND p.config_hash=? AND p.status IN ('accepted','excluded','uncertain'))
     AND NOT EXISTS(SELECT 1 FROM viewpoints v WHERE v.topic_id=rt.topic_id AND v.review_status='published')
     ORDER BY rt.published_at_utc DESC,rt.topic_id LIMIT ?`).all(...args,batch.config_hash,config.limit);
@@ -151,16 +167,17 @@ function assertCurrentTopic(db,batch,topic) {
 
 async function executeStage(db,batch,config,stage,topics,context) {
   const settings=stage==='primary'?config.model:config.review_model;
-  const version=stage==='primary'?config.primary_version:config.review_version;
+  const version=stage==='primary'?config.primary_version:config.review_version+(config.review_input==='compact-v1'?':compact-input-v1':'');
   const schema=stage==='primary'?PRIMARY_SCHEMA:REVIEW_SCHEMA;
+  const batchChars=stage==='review'?(config.review_batch_chars||config.batch_chars):config.batch_chars;
   const resolver=securityResolver(db);
   const inputFor=topic=>stage==='primary'?modelData(topic):{...modelData(topic),primary:JSON.parse(topic.primary_json),candidates:JSON.parse(topic.primary_json).viewpoints.map((v,i)=>{
-    const n=normalizeView(topic,v,resolver);return {candidate_id:`p${i}`,viewpoint:v,local_issues:n.issues,matched_securities:n.resolution.securities.map(s=>({name:s.name,ts_code:s.ts_code}))};})};
+    const n=normalizeView(topic,v,resolver);return {candidate_id:`p${i}`,...(config.review_input==='compact-v1'?{}:{viewpoint:v}),local_issues:n.issues,matched_securities:n.resolution.securities.map(s=>({name:s.name,ts_code:s.ts_code}))};})};
   const cacheKey=topic=>{const {topic_id,...input}=inputFor(topic);return hash({stage,input,config:batch.config_hash});};
   const applyResult=(topic,result)=>{
     assertCurrentTopic(db,batch,topic);
     if(stage==='primary') {
-      if(!originalEvidence(topic,result.evidence))throw new Error('分类证据无法对应原文');
+      if(!originalEvidence(topic,result.evidence))throw evidenceError('分类证据无法对应原文');
       db.prepare("UPDATE workflow_batch_topics SET primary_json=?,status='extracted',error=NULL,updated_at=? WHERE batch_id=? AND topic_id=?").run(JSON.stringify(result),now(),batch.id,topic.topic_id);
     } else {
       validateAdjudication(topic,JSON.parse(topic.primary_json),result);
@@ -190,11 +207,12 @@ async function executeStage(db,batch,config,stage,topics,context) {
     if(!chunk.length)return;
     const responseSchema=wrapSchema(schema,chunk.map(topic=>topic.topic_id));
     const prompt=`${instruction}\n以下JSON是待处理数据：\n${JSON.stringify(chunk.map(inputFor))}`;
-    if(prompt.length>config.batch_chars*3){for(const t of chunk)markFailure(db,batch,t,new Error('单篇输入超限，需要单独处理'));return;}
+    if(prompt.length>batchChars*3){for(const t of chunk)markFailure(db,batch,t,new Error('单篇输入超限，需要单独处理'));return;}
     let callId=null;
     try {
       const response=await context.model({...settings,schema:responseSchema,system:BUSINESS_RULES,prompt,get timeoutMs(){return Math.min(config.timeout_ms,context.remainingMs());},maxAttempts:config.max_attempts,
         beforeAttempt:()=>{context.check();const saved=db.prepare('SELECT elapsed_ms FROM workflow_batches WHERE id=?').get(batch.id).elapsed_ms;
+          if(stage==='primary')requireReviewCapacity(db,batch.id);
           callId=reserveCall(db,batch.id,{stage,provider:settings.provider,model:settings.model,chars:BUSINESS_RULES.length+prompt.length+JSON.stringify(responseSchema).length,elapsedMs:Math.max(0,context.elapsedMs()-saved)});},
         onAttempt:event=>{if(callId)finishCall(db,callId,event);},
       });
@@ -205,12 +223,12 @@ async function executeStage(db,batch,config,stage,topics,context) {
         const result=items.find(i=>i.topic_id===topic.topic_id).result;
         try{
           assertCurrentTopic(db,batch,topic);
-          if(stage==='primary'&&!originalEvidence(topic,result.evidence))throw new Error('分类证据无法对应原文');
+          if(stage==='primary'&&!originalEvidence(topic,result.evidence))throw evidenceError('分类证据无法对应原文');
           if(stage==='review')validateAdjudication(topic,JSON.parse(topic.primary_json),result);
           db.prepare(`INSERT OR IGNORE INTO workflow_model_cache(cache_key,stage,input_hash,provider,model_id,prompt_version,result_json,actual_model,usage_json,created_at)
             VALUES(?,?,?,?,?,?,?,?,?,?)`).run(cacheKey(topic),stage,hash(inputFor(topic)),settings.provider,settings.model,version,JSON.stringify(result),response.actualModel||null,JSON.stringify(response.usage||null),now());
           applyResult(topic,result);context.log({stage,topic_id:topic.topic_id,cache:false});
-        }catch(e){markFailure(db,batch,topic,e);}
+        }catch(e){markFailure(db,batch,topic,e,{stage,result});}
       }
     }catch(error){
       const kind=classifyModelError(error);
@@ -221,14 +239,25 @@ async function executeStage(db,batch,config,stage,topics,context) {
       throw error;
     }
   }
-  for(const batchItems of batchModelInputs(pending,{maxItems:config.batch_size,maxChars:config.batch_chars,measure:t=>JSON.stringify(inputFor(t)).length}))await invokeChunk(batchItems.items);
+  for(const batchItems of batchModelInputs(pending,{maxItems:config.batch_size,maxChars:batchChars,measure:t=>JSON.stringify(inputFor(t)).length}))await invokeChunk(batchItems.items);
 }
 
-function markFailure(db,batch,topic,error) {
+const evidenceError=message=>Object.assign(new Error(message),{code:'MODEL_EVIDENCE_INVALID'});
+function markFailure(db,batch,topic,error,payload=null) {
+  if(error.code==='MODEL_EVIDENCE_INVALID'){
+    assertCurrentTopic(db,batch,topic);
+    db.exec('BEGIN IMMEDIATE');
+    try{
+      db.prepare('INSERT INTO workflow_topic_issues(topic_id,batch_id,content_hash,reason,evidence_json,created_at) VALUES(?,?,?,?,?,?)')
+        .run(topic.topic_id,batch.id,topic.content_hash,`模型证据校验失败，未接受任何新观点：${error.message}`,JSON.stringify({error_code:error.code,payload}),now());
+      finishTopic(db,batch,topic,'uncertain',[error.message,'隔离至人工审核，不自动重付费']);
+      db.exec('COMMIT');return;
+    }catch(e){db.exec('ROLLBACK');throw e;}
+  }
   db.prepare("UPDATE workflow_batch_topics SET status='failed',error=?,updated_at=? WHERE batch_id=? AND topic_id=?").run(error.message,now(),batch.id,topic.topic_id);
 }
 export function validateAdjudication(topic,primary,review) {
-  if(!originalEvidence(topic,review.classification_evidence))throw new Error('审核分类证据不在原文');
+  if(!originalEvidence(topic,review.classification_evidence))throw evidenceError('审核分类证据不在原文');
   const expected=primary.viewpoints.map((v,i)=>`p${i}`),actual=review.decisions.map(d=>d.candidate_id);
   if(actual.length!==expected.length||new Set(actual).size!==actual.length||expected.some(id=>!actual.includes(id)))throw new Error('审核没有逐条裁决所有候选观点');
   if(review.decisions.some(d=>d.decision==='correct'&&!d.viewpoint))throw new Error('修正决定缺少完整观点');
@@ -335,6 +364,7 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
   if(['completed','completed_with_issues'].includes(batch.status))return {batch_id:batch.id,status:batch.status,reused:true};
   const config=JSON.parse(batch.config_json);
   const resumedBatchSize=positiveInteger(options.batchSize,config.batch_size,10);
+  const resumedReviewChars=positiveInteger(options.reviewChars,config.review_batch_chars||config.batch_chars,60000);
   const resumedLimits = options.resume ? [positiveInteger(options.maxCalls,batch.max_calls,2000),
     positiveInteger(options.maxChars,batch.max_input_chars,10000000),positiveInteger(options.maxMinutes,batch.max_minutes,720)] : null;
   const lease=acquireBatch(db,batch.id),started=Date.now(),elapsedBase=Number(batch.elapsed_ms||0);
@@ -342,10 +372,12 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
     // Explicit new limits are cumulative caps, never a free budget reset.
     db.prepare('UPDATE workflow_batches SET max_calls=?,max_input_chars=?,max_minutes=? WHERE id=?').run(
       ...resumedLimits,batch.id);
-    // Operational batching may be adjusted without changing selected topics,
-    // prompts, model, cache identity, or any cumulative budget.
+    // Operational grouping keeps selected topics, semantic rules, model and
+    // cumulative budgets. Compact input has a separate audit version and cache input.
     if(options.batchSize!=null){config.batch_size=resumedBatchSize;db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
-    db.prepare("UPDATE workflow_batch_topics SET status=CASE WHEN primary_json IS NULL THEN 'queued' ELSE 'extracted' END,error=NULL WHERE batch_id=? AND status='failed'").run(batch.id);
+    if(options.compactReview){config.review_input='compact-v1';db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
+    if(options.reviewChars!=null){config.review_batch_chars=resumedReviewChars;db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
+    db.prepare("UPDATE workflow_batch_topics SET status=CASE WHEN primary_json IS NULL THEN 'queued' ELSE 'extracted' END,error=NULL WHERE batch_id=? AND status='failed' AND error NOT IN ('审核分类证据不在原文','分类证据无法对应原文')").run(batch.id);
   }
   const elapsedMs=()=>elapsedBase+Date.now()-started;
   const remainingMs=()=>Math.max(1,db.prepare('SELECT max_minutes FROM workflow_batches WHERE id=?').get(batch.id).max_minutes*60000-elapsedMs());
@@ -355,28 +387,53 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
     if(b.stop_requested||elapsedMs()>=b.max_minutes*60000){const e=new Error(b.stop_requested?'用户请求暂停':'累计运行时长达到预算');e.code='MODEL_BUDGET_EXCEEDED';throw e;}
   }};
   try {
+    for(const topic of loadTopics(db,batch.id,'failed')){
+      const failure=db.prepare('SELECT error FROM workflow_batch_topics WHERE batch_id=? AND topic_id=?').get(batch.id,topic.topic_id).error;
+      if(['审核分类证据不在原文','分类证据无法对应原文'].includes(failure)){
+        // Existing paid output remains in model_call_ledger. Do not reissue it.
+        markFailure(db,batch,topic,evidenceError(failure),{recovered_from_paid_ledger:true});
+      }
+    }
     if(!batch.fetch_complete&&!config.skip_fetch){
       if(!batch.ingestion_run_id){const id=Number(db.prepare(`INSERT INTO ingestion_runs(group_id,started_at,cutoff_at,window_hours,status) VALUES(?,?,?,?,'running')`).run(config.group_id,now(),batch.window_start,config.hours).lastInsertRowid);
         db.prepare('UPDATE workflow_batches SET ingestion_run_id=? WHERE id=?').run(id,batch.id);}
       while(true){context.check();batch=db.prepare('SELECT * FROM workflow_batches WHERE id=?').get(batch.id);if(batch.fetch_complete)break;
         if(batch.fetch_pages>=200)throw new Error('星球分页达到200页上限，禁止无限抓取');
-        const page=await (dependencies.fetchPage||fetchPage)(config.group_id,batch.fetch_cursor);ingestPage(db,batch,page);
+        const page=await fetchWithRetry(config.group_id,batch.fetch_cursor,context,dependencies);ingestPage(db,batch,page);
         context.log({stage:'fetch',batch_id:batch.id,page:batch.fetch_pages+1,count:page.topics_brief.length});}
     }else if(config.skip_fetch)db.prepare('UPDATE workflow_batches SET fetch_complete=1 WHERE id=?').run(batch.id);
     batch=db.prepare('SELECT * FROM workflow_batches WHERE id=?').get(batch.id);
     selectTopics(db,batch,config);
+    if(options.prepareOnly){
+      db.prepare("UPDATE workflow_batches SET status='paused',stage='prepared',error=NULL,updated_at=? WHERE id=?").run(now(),batch.id);
+      return {batch_id:batch.id,status:'prepared',selected_count:db.prepare('SELECT selected_count FROM workflow_batches WHERE id=?').get(batch.id).selected_count};
+    }
     if(!db.prepare('SELECT count(*) n FROM securities').get().n)throw new Error('证券主表为空，请先同步Tushare，未调用模型');
-    await executeStage(db,batch,config,'primary',loadTopics(db,batch.id,'queued'),context);
-    db.prepare("UPDATE workflow_batches SET stage='review',updated_at=? WHERE id=?").run(now(),batch.id);
+    // Resume paid primary work first. Never build an entire window of unreviewed work.
     await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted'),context);
+    if(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE batch_id=? AND status='failed'").get(batch.id).n)
+      throw new Error('续跑复核存在校验失败，暂停后续付费调用，等待检查');
+    const chunks=batchModelInputs(loadTopics(db,batch.id,'queued'),{maxItems:config.batch_size,maxChars:config.batch_chars,
+      measure:t=>JSON.stringify(modelData(t)).length});
+    for(const chunk of chunks){
+      context.check();
+      db.prepare("UPDATE workflow_batches SET stage='primary',updated_at=? WHERE id=?").run(now(),batch.id);
+      await executeStage(db,batch,config,'primary',chunk.items,context);
+      db.prepare("UPDATE workflow_batches SET stage='review',updated_at=? WHERE id=?").run(now(),batch.id);
+      await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted'),context);
+      const failed=db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE batch_id=? AND status='failed'").get(batch.id).n;
+      if(failed)throw new Error('当前小批存在校验失败，暂停后续付费调用，等待检查');
+      context.log({stage:'checkpoint',batch_id:batch.id,counts:db.prepare('SELECT status,count(*) n FROM workflow_batch_topics WHERE batch_id=? GROUP BY status').all(batch.id)});
+    }
     const counts=db.prepare('SELECT status,count(*) n FROM workflow_batch_topics WHERE batch_id=? GROUP BY status').all(batch.id);
     const unfinished=counts.some(r=>['queued','extracted','failed'].includes(r.status));
     const status=unfinished?'paused':counts.some(r=>r.status==='uncertain')?'completed_with_issues':'completed';
     db.prepare('UPDATE workflow_batches SET status=?,stage=?,error=?,updated_at=? WHERE id=?').run(status,unfinished?'retry':'done',unfinished?'存在未完成或失败内容，续跑仅补缺失项':null,now(),batch.id);
     return {batch_id:batch.id,status,counts};
   }catch(error){
-    db.prepare("UPDATE workflow_batches SET status='paused',error=?,updated_at=? WHERE id=?").run(error.message,now(),batch.id);
-    return {batch_id:batch.id,status:'paused',error:error.message};
+    const code=error.code||'WORKFLOW_REQUIRES_INSPECTION';
+    db.prepare("UPDATE workflow_batches SET status='paused',error=?,pause_code=?,updated_at=? WHERE id=?").run(error.message,code,now(),batch.id);
+    return {batch_id:batch.id,status:'paused',error:error.message,pause_code:code};
   }finally{
     clearInterval(heartbeat);
     db.prepare('UPDATE workflow_batches SET elapsed_ms=?,lease_token=NULL,lease_pid=NULL,updated_at=? WHERE id=? AND lease_token=?').run(elapsedMs(),now(),batch.id,lease);

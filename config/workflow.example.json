@@ -44,6 +44,7 @@
     "max_minutes": 30,
     "batch_size": 3,
     "batch_chars": 12000,
+    "review_batch_chars": 40000,
     "max_attempts": 2,
     "timeout_ms": 180000,
     "auto_publish": false
