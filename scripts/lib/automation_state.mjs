@@ -83,7 +83,7 @@ export function getAutomationStatus(db) {
     (SELECT max(finished_at) FROM ingestion_runs WHERE status='success') last_fetch_at FROM raw_topics`).get() : {};
   const batches = hasTable(db, 'workflow_batches') ? db.prepare(`SELECT id,status,stage,created_at,updated_at,window_start,window_end,
     selected_count,calls_used,input_chars_used,max_calls,max_input_chars,max_minutes,elapsed_ms,stop_requested,error,fetch_pages,fetch_complete,
-    heartbeat_at,lease_pid FROM workflow_batches ORDER BY id DESC LIMIT 20`).all().map(b => {
+    heartbeat_at,lease_pid,json_extract(config_json,'$.auto_publish') auto_publish_enabled FROM workflow_batches ORDER BY id DESC LIMIT 20`).all().map(b => {
       let alive=false; if(b.lease_pid)try{process.kill(b.lease_pid,0);alive=true;}catch(e){alive=e.code==='EPERM';}
       return {...b,worker_alive:alive,resumable:['paused','failed'].includes(b.status)||(b.status==='running'&&!alive),
         remaining_issues:db.prepare("SELECT count(*) n FROM workflow_topic_issues WHERE batch_id=? AND status='pending'").get(b.id).n,
@@ -93,8 +93,11 @@ export function getAutomationStatus(db) {
     WHERE eligibility='eligible' AND published_at_utc>=? AND NOT EXISTS(SELECT 1 FROM topic_processing_state p
       WHERE p.topic_id=rt.topic_id AND p.content_hash=rt.content_hash AND p.status IN ('accepted','excluded','uncertain'))`).get(new Date(Date.now() - 168 * 3600000).toISOString()).n : 0;
   const daily=dailyBudget(db);
+  const autoPublishEvents=hasTable(db,'workflow_auto_publish_events')?db.prepare(`SELECT id,batch_id,status,published_count,blocked_json,backup_path,error,created_at
+    FROM workflow_auto_publish_events ORDER BY id DESC LIMIT 10`).all():[];
   return { batches, latest_batch: batches[0] || null, coverage, pending_recent: pending, defaults: DEFAULT_LIMITS, daily_budget: daily,
-    cost_note: `上海日期 ${daily.day} 全部批次合计：${daily.calls_used}/${daily.max_calls} 次调用、${daily.input_chars_used}/${daily.max_input_chars} 输入字符。CLI内部网络重试不可逐次计数，也不是美元账单。预算达到后暂停，续跑不清零；尚未启用每日定时触发。` };
+    auto_publish_events:autoPublishEvents,
+    cost_note: `上海日期 ${daily.day} 全部批次合计：${daily.calls_used}/${daily.max_calls} 次调用、${daily.input_chars_used}/${daily.max_input_chars} 输入字符。CLI内部网络重试不可逐次计数，也不是美元账单。${batches[0]?.auto_publish_enabled?'自动发布已开启：仅独立审核与门禁通过的高置信观点，存疑留人工。':'自动发布未开启。'}预算达到后暂停，续跑不清零；尚未启用每日定时触发。` };
 }
 
 export function requestBatchStop(db, id) {

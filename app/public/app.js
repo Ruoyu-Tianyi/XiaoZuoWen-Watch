@@ -229,7 +229,7 @@ function renderAutomation(data) {
   else if (data.batches.some((item) => String(item.id) === selectedBatch)) batchSelect.value = selectedBatch;
   renderBatchPublish();
   const coverage = `原文最新：${formatTime(data.coverage?.latest)} · 最近成功抓取：${formatTime(data.coverage?.last_fetch_at)} · 最近7天待处理 ${formatNumber(data.pending_recent)} 篇 · 未解决疑点 ${formatNumber(data.remaining_issues)} 项`;
-  if (!batch) { $('#automationProgress').textContent = `${coverage}\n尚无增量批次。点击“一键增量入库”开始；不会自动发布。`; return; }
+  if (!batch) { $('#automationProgress').textContent = `${coverage}\n尚无增量批次。点击“一键增量入库”开始；发布方式遵循本机配置。`; return; }
   const counts = batch.counts || {};
   const stage = stageLabel(batch.stage);
   const batchStatus = batch.status === 'running' && batch.worker_alive === false ? '进程已退出，可续跑' : statusLabel(batch.status);
@@ -278,7 +278,7 @@ async function runAutomation(resume = false) {
     if (resume) body.resume = state.automation?.batches.find((item) => ['paused', 'failed'].includes(item.status) || (item.status === 'running' && item.worker_alive === false))?.id;
     if (resume && !body.resume) throw new Error('没有可续跑批次');
     await api('/api/automation/run', jsonOptions('POST', body));
-    showNotice('#workflowNotice', resume ? '已请求续跑；沿用原批次累计预算。' : '增量流程已启动；正式发布仍需你确认。');
+    showNotice('#workflowNotice', resume ? '已请求续跑；沿用原批次累计预算及发布设置。' : '增量流程已启动；按本机发布设置执行，存疑项保留人工审核。');
     await loadWorkflow();
   } catch (error) { showNotice('#workflowNotice', `无法启动：${error.message}`, true); }
 }

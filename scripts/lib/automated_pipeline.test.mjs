@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { ensureWorkflowSchema } from './workflow_db.mjs';
 import { runAutomatedPipeline, createBatch } from './automated_pipeline.mjs';
 import { runRecentPipeline } from './recent_pipeline.mjs';
+import { autoPublishReady, ensureAutoPublishSchema } from './auto_publish.mjs';
 import { acquireBatch, reserveCall, ensureAutomationSchema, hash, dailyBudget, DAILY_LIMITS } from './automation_state.mjs';
 import { callStructuredModel } from './model_client.mjs';
 import { recordApproval, validatePublishBatch, publishAccepted } from './approval_guard.mjs';
@@ -489,6 +490,97 @@ test('review uses its own character grouping instead of fragmenting on primary i
   const result=await runAutomatedPipeline(db,options,fake.dependencies);
   assert.equal(result.status,'completed',JSON.stringify(result));
   assert.deepEqual(fake.calls.map(c=>[c.stage,c.topicIds.length]),[['primary',3],['review',3]]);
+});
+
+test('enabled automation publishes reviewed closed topics with backup and atomic audit',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies();
+  const result=await runAutomatedPipeline(db,opts({autoPublish:true}),{...fake.dependencies,backupDir:join(directory,'backups')});
+  assert.equal(result.status,'completed',JSON.stringify(result));
+  assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'published');
+  const event=db.prepare("SELECT * FROM workflow_auto_publish_events WHERE status='published'").get();
+  assert.equal(event.published_count,1);assert.ok(existsSync(event.backup_path));
+  assert.equal(count(db,'viewpoint_publish_batches'),1);
+  const rerun=await autoPublishReady(db,result.batch_id,{backupDir:join(directory,'backups')});
+  assert.equal(rerun.published,0);assert.equal(count(db,'viewpoint_publish_batches'),1);
+  assert.equal(fake.calls.length,2,'publication must not make a third model call');
+});
+
+test('completed small chunk can publish while other queued topics remain unprocessed',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies({topics:[source(),source({topic_id:'987654321',content:`${BODY}第二篇`})]});
+  const run=await runAutomatedPipeline(db,opts({autoPublish:true,batchSize:1,maxCalls:2}),{...fake.dependencies,backupDir:join(directory,'backups')});
+  assert.equal(run.status,'paused');assert.equal(fake.calls.length,2);
+  assert.equal(db.prepare("SELECT count(*) n FROM viewpoints WHERE review_status='published'").get().n,1);
+  assert.equal(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE status='queued'").get().n,1);
+});
+
+test('automatic publisher never replaces a human approval or publishes it as AI-reviewed',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies();
+  const run=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  const id=db.prepare('SELECT id FROM viewpoints').get().id;
+  recordApproval(db,{viewpointId:id,decision:'accept',method:'human',scopeDecision:'broker_note',reason:'人工决定'});
+  const result=await autoPublishReady(db,run.batch_id,{backupDir:join(directory,'backups')});
+  assert.equal(result.published,0);assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'reviewed');
+  assert.equal(db.prepare('SELECT method FROM viewpoint_approval_audit ORDER BY id DESC').get().method,'human');
+});
+
+test('automatic publication holds lower confidence and topic uncertainty for humans',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies({transform:({stage,result})=>{
+    if(stage==='review')result.items[0].result.decisions[0].confidence=.92;return result;
+  }});
+  const result=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  let published=await autoPublishReady(db,result.batch_id,{backupDir:join(directory,'backups')});
+  assert.equal(published.published,0);assert.match(published.blocked[0].reason,/置信度/);
+  const id=db.prepare('SELECT id FROM viewpoints').get().id;
+  assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'candidate');
+  recordApproval(db,{viewpointId:id,decision:'accept',method:'ai',scopeDecision:'broker_note',reason:'fixture',modelId:'fixture-model',metadata:{confidence:.99}});
+  db.prepare("UPDATE viewpoints SET review_status='reviewed' WHERE id=?").run(id);
+  db.prepare("INSERT INTO workflow_topic_issues(topic_id,batch_id,content_hash,reason,created_at) SELECT topic_id,?,content_hash,'fixture uncertainty','2026-09-12' FROM raw_topics").run(result.batch_id);
+  published=await autoPublishReady(db,result.batch_id,{backupDir:join(directory,'backups')});
+  assert.equal(published.published,0);assert.match(published.blocked[0].reason,/主题级疑点/);
+  assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'candidate');
+});
+
+test('publication never sweeps legacy reviewed rows outside the specified workflow batch',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies();
+  const first=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  const second=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  const result=await autoPublishReady(db,second.batch_id,{backupDir:join(directory,'backups')});
+  assert.equal(result.published,0);
+  assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'reviewed');
+  assert.equal(batchRow(db,first.batch_id).calls_used,2);
+});
+
+test('automatic publication aborts without changing views if backup or atomic audit fails',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies();
+  const run=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  await assert.rejects(autoPublishReady(db,run.batch_id,{backupDir:join(directory,'fixture.sqlite')}));
+  assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'reviewed');
+  ensureAutoPublishSchema(db);
+  db.exec("CREATE TRIGGER fixture_fail_auto_audit BEFORE INSERT ON workflow_auto_publish_events BEGIN SELECT RAISE(ABORT,'fixture audit failed'); END");
+  await assert.rejects(autoPublishReady(db,run.batch_id,{backupDir:join(directory,'backups')}),/fixture audit failed/);
+  assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'reviewed');
+  assert.equal(count(db,'viewpoint_publish_batches'),0);
+});
+
+test('topic doubt introduced during backup blocks publication even with unchanged viewpoint fingerprints',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies();
+  const run=await runAutomatedPipeline(db,opts(),fake.dependencies);
+  const publishing=autoPublishReady(db,run.batch_id,{backupDir:join(directory,'backups')});
+  queueMicrotask(()=>db.prepare("INSERT INTO workflow_topic_issues(topic_id,batch_id,content_hash,reason,created_at) SELECT topic_id,?,content_hash,'new doubt','2026-09-12' FROM raw_topics").run(run.batch_id));
+  await assert.rejects(publishing,/疑点状态已变化/);
+  assert.equal(db.prepare('SELECT review_status FROM viewpoints').get().review_status,'reviewed');
+  assert.equal(count(db,'viewpoint_publish_batches'),0);
+});
+
+test('single-topic incomplete adjudication is quarantined without publishing that topic',async t=>{
+  const {db,directory}=fixture(t),fake=fakeDependencies({transform:({stage,result})=>{
+    if(stage==='review')result.items[0].result.decisions=[];return result;
+  }});
+  const result=await runAutomatedPipeline(db,opts({autoPublish:true}),{...fake.dependencies,backupDir:join(directory,'backups')});
+  assert.equal(result.status,'completed_with_issues');
+  assert.equal(topicRow(db,result.batch_id).status,'uncertain');
+  assert.equal(count(db,'viewpoints'),0);assert.equal(count(db,'viewpoint_publish_batches'),0);
+  assert.equal(fake.calls.length,2);
 });
 
 test('Shanghai daily budget counts failed calls across batches and cannot be reset by a new batch',t=>{

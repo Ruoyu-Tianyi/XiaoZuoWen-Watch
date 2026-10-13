@@ -28,6 +28,7 @@ export async function runRecentPipeline(db, options={}, dependencies={}) {
     throw new Error('recent 运行预算必须为整数，调用数至少为2');
   const runOptions=pending?{resume:pending.id,batchSize:options.batchSize??10,prepareOnly:!!options.prepareOnly,
     reviewChars:options.reviewChars??40000,compactReview:true,
+    autoPublish:options.autoPublish,
     maxCalls:Number(pending.calls_used)+calls,maxChars:Number(pending.input_chars_used)+chars,
     maxMinutes:Math.ceil(Number(pending.elapsed_ms)/60000)+minutes}
     :{...options,windowEnd:end,hours:168,limit:options.limit??5000,batchSize:options.batchSize??10,

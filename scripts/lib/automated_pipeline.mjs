@@ -6,6 +6,7 @@ import { callStructuredModel, classificationSchema, extractionSchema, batchModel
 import { hash, now, POLICY_VERSION, DEFAULT_LIMITS, ensureAutomationSchema, acquireBatch, reserveCall, finishCall, finishTopic, requireReviewCapacity } from './automation_state.mjs';
 import { originalEvidence, readableText, sourceText, securityResolver, normalizeView, normalizeSource, normalizeName } from './note_normalization.mjs';
 import { recordApproval, validatePublishBatch } from './approval_guard.mjs';
+import { autoPublishReady } from './auto_publish.mjs';
 
 export const PRIMARY_SCHEMA = { type: 'object', additionalProperties: false,
   required: [...classificationSchema.required, ...extractionSchema.required],
@@ -56,6 +57,7 @@ export function configuration(options = {}) {
     max_attempts:positiveInteger(a.max_attempts,2,3), timeout_ms:positiveInteger(a.timeout_ms,180000,600000),
     skip_fetch:!!options.skipFetch, reconcile:!!options.reconcile,
     review_input: 'compact-v1',
+    auto_publish: options.autoPublish ?? !!a.auto_publish,
   };
 }
 
@@ -244,12 +246,12 @@ async function executeStage(db,batch,config,stage,topics,context) {
 
 const evidenceError=message=>Object.assign(new Error(message),{code:'MODEL_EVIDENCE_INVALID'});
 function markFailure(db,batch,topic,error,payload=null) {
-  if(error.code==='MODEL_EVIDENCE_INVALID'){
+  if(['MODEL_EVIDENCE_INVALID','MODEL_TOPIC_REVIEW_INVALID'].includes(error.code)){
     assertCurrentTopic(db,batch,topic);
     db.exec('BEGIN IMMEDIATE');
     try{
       db.prepare('INSERT INTO workflow_topic_issues(topic_id,batch_id,content_hash,reason,evidence_json,created_at) VALUES(?,?,?,?,?,?)')
-        .run(topic.topic_id,batch.id,topic.content_hash,`模型证据校验失败，未接受任何新观点：${error.message}`,JSON.stringify({error_code:error.code,payload}),now());
+        .run(topic.topic_id,batch.id,topic.content_hash,`模型单篇校验失败，未接受任何新观点：${error.message}`,JSON.stringify({error_code:error.code,payload}),now());
       finishTopic(db,batch,topic,'uncertain',[error.message,'隔离至人工审核，不自动重付费']);
       db.exec('COMMIT');return;
     }catch(e){db.exec('ROLLBACK');throw e;}
@@ -259,8 +261,8 @@ function markFailure(db,batch,topic,error,payload=null) {
 export function validateAdjudication(topic,primary,review) {
   if(!originalEvidence(topic,review.classification_evidence))throw evidenceError('审核分类证据不在原文');
   const expected=primary.viewpoints.map((v,i)=>`p${i}`),actual=review.decisions.map(d=>d.candidate_id);
-  if(actual.length!==expected.length||new Set(actual).size!==actual.length||expected.some(id=>!actual.includes(id)))throw new Error('审核没有逐条裁决所有候选观点');
-  if(review.decisions.some(d=>d.decision==='correct'&&!d.viewpoint))throw new Error('修正决定缺少完整观点');
+  if(actual.length!==expected.length||new Set(actual).size!==actual.length||expected.some(id=>!actual.includes(id)))throw Object.assign(new Error('审核没有逐条裁决所有候选观点'),{code:'MODEL_TOPIC_REVIEW_INVALID'});
+  if(review.decisions.some(d=>d.decision==='correct'&&!d.viewpoint))throw Object.assign(new Error('修正决定缺少完整观点'),{code:'MODEL_TOPIC_REVIEW_INVALID'});
 }
 
 export function persistAdjudication(db,batch,topic,primary,review,settings,version) {
@@ -377,7 +379,8 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
     if(options.batchSize!=null){config.batch_size=resumedBatchSize;db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
     if(options.compactReview){config.review_input='compact-v1';db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
     if(options.reviewChars!=null){config.review_batch_chars=resumedReviewChars;db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
-    db.prepare("UPDATE workflow_batch_topics SET status=CASE WHEN primary_json IS NULL THEN 'queued' ELSE 'extracted' END,error=NULL WHERE batch_id=? AND status='failed' AND error NOT IN ('审核分类证据不在原文','分类证据无法对应原文')").run(batch.id);
+    if(options.autoPublish!=null){config.auto_publish=!!options.autoPublish;db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);}
+    db.prepare("UPDATE workflow_batch_topics SET status=CASE WHEN primary_json IS NULL THEN 'queued' ELSE 'extracted' END,error=NULL WHERE batch_id=? AND status='failed' AND error NOT IN ('审核分类证据不在原文','分类证据无法对应原文','审核没有逐条裁决所有候选观点','修正决定缺少完整观点')").run(batch.id);
   }
   const elapsedMs=()=>elapsedBase+Date.now()-started;
   const remainingMs=()=>Math.max(1,db.prepare('SELECT max_minutes FROM workflow_batches WHERE id=?').get(batch.id).max_minutes*60000-elapsedMs());
@@ -389,7 +392,7 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
   try {
     for(const topic of loadTopics(db,batch.id,'failed')){
       const failure=db.prepare('SELECT error FROM workflow_batch_topics WHERE batch_id=? AND topic_id=?').get(batch.id,topic.topic_id).error;
-      if(['审核分类证据不在原文','分类证据无法对应原文'].includes(failure)){
+      if(['审核分类证据不在原文','分类证据无法对应原文','审核没有逐条裁决所有候选观点','修正决定缺少完整观点'].includes(failure)){
         // Existing paid output remains in model_call_ledger. Do not reissue it.
         markFailure(db,batch,topic,evidenceError(failure),{recovered_from_paid_ledger:true});
       }
@@ -409,8 +412,15 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
       return {batch_id:batch.id,status:'prepared',selected_count:db.prepare('SELECT selected_count FROM workflow_batches WHERE id=?').get(batch.id).selected_count};
     }
     if(!db.prepare('SELECT count(*) n FROM securities').get().n)throw new Error('证券主表为空，请先同步Tushare，未调用模型');
+    const publishReady=async()=>{
+      if(!config.auto_publish)return;
+      const published=await autoPublishReady(db,batch.id,{backupDir:dependencies.backupDir||'data/backups-v2'});
+      context.log({stage:'auto_publish',batch_id:batch.id,published:published.published,blocked:published.blocked.length,backup:published.backup||null});
+    };
+    await publishReady();
     // Resume paid primary work first. Never build an entire window of unreviewed work.
     await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted'),context);
+    await publishReady();
     if(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE batch_id=? AND status='failed'").get(batch.id).n)
       throw new Error('续跑复核存在校验失败，暂停后续付费调用，等待检查');
     const chunks=batchModelInputs(loadTopics(db,batch.id,'queued'),{maxItems:config.batch_size,maxChars:config.batch_chars,
@@ -421,6 +431,7 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
       await executeStage(db,batch,config,'primary',chunk.items,context);
       db.prepare("UPDATE workflow_batches SET stage='review',updated_at=? WHERE id=?").run(now(),batch.id);
       await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted'),context);
+      await publishReady();
       const failed=db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE batch_id=? AND status='failed'").get(batch.id).n;
       if(failed)throw new Error('当前小批存在校验失败，暂停后续付费调用，等待检查');
       context.log({stage:'checkpoint',batch_id:batch.id,counts:db.prepare('SELECT status,count(*) n FROM workflow_batch_topics WHERE batch_id=? GROUP BY status').all(batch.id)});

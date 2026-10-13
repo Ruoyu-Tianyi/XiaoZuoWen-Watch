@@ -186,7 +186,7 @@ function failPreflight(report) {
   throw error;
 }
 
-export async function publishAccepted(db, { ids, backupDir = 'data/backups-v2' } = {}) {
+export async function publishAccepted(db, { ids, backupDir = 'data/backups-v2', onPublish } = {}) {
   ensureApprovalSchema(db);
   const initial = validatePublishBatch(db, ids);
   if (!initial.ok) failPreflight(initial);
@@ -210,6 +210,7 @@ export async function publishAccepted(db, { ids, backupDir = 'data/backups-v2' }
     for (const id of checked.ids) {
       if (Number(update.run(when, when, id).changes) !== 1) throw new Error(`观点 ${id} 状态已变化`);
     }
+    if(onPublish)onPublish({published:checked.ids.length,backup:backupPath,batchId,ids:checked.ids});
     db.exec('COMMIT');
     return { published: checked.ids.length, backup: backupPath, batchId };
   } catch (error) {
