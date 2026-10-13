@@ -18,6 +18,8 @@ try {
       prepareOnly:process.argv.includes('--prepare-only'),
       compactReview:process.argv.includes('--compact-review'),
       reviewChars:option('review-chars'),
+      unlimitedCalls:process.argv.includes('--unlimited-calls')?true:process.argv.includes('--limited-calls')?false:undefined,
+      dailyMaxChars:option('max-daily-chars'),concurrency:option('concurrency'),
       autoPublish:process.argv.includes('--auto-publish')?true:process.argv.includes('--no-auto-publish')?false:undefined,
       skipFetch:process.argv.includes('--skip-fetch'),reconcile:process.argv.includes('--reconcile-pilot')},
       {log:event=>console.log(JSON.stringify(event))});

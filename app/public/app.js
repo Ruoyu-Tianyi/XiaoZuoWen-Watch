@@ -233,8 +233,8 @@ function renderAutomation(data) {
   const counts = batch.counts || {};
   const stage = stageLabel(batch.stage);
   const batchStatus = batch.status === 'running' && batch.worker_alive === false ? '进程已退出，可续跑' : statusLabel(batch.status);
-  $('#runtimeState').textContent = `批次 ${batch.id} · ${batchStatus}`;
-  $('#automationProgress').textContent = `${coverage}\n批次 ${batch.id} · ${batchStatus} · ${stage}${batch.stop_requested ? ' · 已请求安全暂停' : ''}\n窗口 ${formatTime(batch.window_start)} — ${formatTime(batch.window_end)} · 已抓取 ${batch.fetch_pages || 0} 页 · 本批次 ${batch.selected_count} 篇\n待处理 ${counts.queued || 0} · 已识别 ${counts.extracted || 0} · 接受 ${counts.accepted || 0} · 排除 ${counts.excluded || 0} · 存疑 ${counts.uncertain || 0} · 失败 ${counts.failed || 0}\n模型调用 ${batch.calls_used} / ${batch.max_calls} 次 · 输入 ${formatNumber(batch.input_chars_used)} / ${formatNumber(batch.max_input_chars)} 字符 · 累计 ${Math.round((batch.elapsed_ms || 0) / 60000)} / ${batch.max_minutes} 分钟${batch.error && !running ? `\n暂停或错误原因：${batch.error}` : ''}\n${data.cost_note}`;
+  $('#runtimeState').textContent = `批次 ${batch.id} · ${batchStatus}${batch.unlimited_calls ? ' · 不设调用次数上限' : ''}`;
+  $('#automationProgress').textContent = `${coverage}\n批次 ${batch.id} · ${batchStatus} · ${stage}${batch.stop_requested ? ' · 已请求安全暂停' : ''}\n窗口 ${formatTime(batch.window_start)} — ${formatTime(batch.window_end)} · 已抓取 ${batch.fetch_pages || 0} 页 · 本批次 ${batch.selected_count} 篇\n待处理 ${counts.queued || 0} · 已识别 ${counts.extracted || 0} · 接受 ${counts.accepted || 0} · 排除 ${counts.excluded || 0} · 存疑 ${counts.uncertain || 0} · 失败 ${counts.failed || 0}\n模型调用 ${batch.calls_used} / ${batch.unlimited_calls ? '无上限' : batch.max_calls} 次 · ${batch.concurrency || 1} 路处理 · 输入 ${formatNumber(batch.input_chars_used)} / ${formatNumber(batch.max_input_chars)} 字符 · 累计 ${Math.round((batch.elapsed_ms || 0) / 60000)} / ${batch.max_minutes} 分钟${batch.error && !running ? `\n暂停或错误原因：${batch.error}` : ''}\n${data.cost_note}`;
 }
 
 function renderAutomationCalls(rows) {

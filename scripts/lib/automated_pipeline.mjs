@@ -48,7 +48,10 @@ export function configuration(options = {}) {
   const model = a.model || { provider:'codex', model:'gpt-5.6-luna' };
   return { group_id: config.group_id, policy_version:POLICY_VERSION, primary_version:'combined-extraction-v1', review_version:'explicit-adjudication-v1',
     model, review_model:a.review_model || model, hours:positiveInteger(options.hours,168,168),
-    max_calls:positiveInteger(options.maxCalls,a.max_calls || DEFAULT_LIMITS.max_calls,2000),
+    max_calls:options.unlimitedCalls?0:positiveInteger(options.maxCalls,a.max_calls || DEFAULT_LIMITS.max_calls,2000),
+    unlimited_calls:!!options.unlimitedCalls,
+    daily_input_chars_limit:positiveInteger(options.dailyMaxChars,600000,10000000),
+    concurrency:positiveInteger(options.concurrency,1,2),
     max_input_chars:positiveInteger(options.maxChars,a.max_input_chars || DEFAULT_LIMITS.max_input_chars,10000000),
     max_minutes:positiveInteger(options.maxMinutes,a.max_minutes || DEFAULT_LIMITS.max_minutes,720),
     limit:positiveInteger(options.limit,a.limit || DEFAULT_LIMITS.limit,5000),
@@ -367,10 +370,15 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
   const config=JSON.parse(batch.config_json);
   const resumedBatchSize=positiveInteger(options.batchSize,config.batch_size,10);
   const resumedReviewChars=positiveInteger(options.reviewChars,config.review_batch_chars||config.batch_chars,60000);
-  const resumedLimits = options.resume ? [positiveInteger(options.maxCalls,batch.max_calls,2000),
+  const unlimitedCalls=options.unlimitedCalls??!!config.unlimited_calls;
+  const resumedConcurrency=positiveInteger(options.concurrency,config.concurrency||1,2);
+  const resumedDailyChars=positiveInteger(options.dailyMaxChars,config.daily_input_chars_limit||600000,10000000);
+  const resumedLimits = options.resume ? [unlimitedCalls?0:positiveInteger(options.maxCalls,batch.max_calls||DEFAULT_LIMITS.max_calls,2000),
     positiveInteger(options.maxChars,batch.max_input_chars,10000000),positiveInteger(options.maxMinutes,batch.max_minutes,720)] : null;
   const lease=acquireBatch(db,batch.id),started=Date.now(),elapsedBase=Number(batch.elapsed_ms||0);
   if(options.resume){
+    config.unlimited_calls=unlimitedCalls;config.concurrency=resumedConcurrency;config.daily_input_chars_limit=resumedDailyChars;
+    db.prepare('UPDATE workflow_batches SET config_json=? WHERE id=?').run(JSON.stringify(config),batch.id);
     // Explicit new limits are cumulative caps, never a free budget reset.
     db.prepare('UPDATE workflow_batches SET max_calls=?,max_input_chars=?,max_minutes=? WHERE id=?').run(
       ...resumedLimits,batch.id);
@@ -386,6 +394,7 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
   const remainingMs=()=>Math.max(1,db.prepare('SELECT max_minutes FROM workflow_batches WHERE id=?').get(batch.id).max_minutes*60000-elapsedMs());
   const heartbeat=setInterval(()=>db.prepare('UPDATE workflow_batches SET elapsed_ms=?,heartbeat_at=?,updated_at=? WHERE id=? AND lease_token=?').run(elapsedMs(),now(),now(),batch.id,lease),10000);
   const context={started,elapsedMs,remainingMs,preflight:new Set(),model:dependencies.model||callStructuredModel,probe:dependencies.preflight||preflightModel,log:dependencies.log||(()=>{}),check:()=>{
+    if(context.abort)throw context.abort;
     const b=db.prepare('SELECT * FROM workflow_batches WHERE id=?').get(batch.id);
     if(b.stop_requested||elapsedMs()>=b.max_minutes*60000){const e=new Error(b.stop_requested?'用户请求暂停':'累计运行时长达到预算');e.code='MODEL_BUDGET_EXCEEDED';throw e;}
   }};
@@ -412,11 +421,12 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
       return {batch_id:batch.id,status:'prepared',selected_count:db.prepare('SELECT selected_count FROM workflow_batches WHERE id=?').get(batch.id).selected_count};
     }
     if(!db.prepare('SELECT count(*) n FROM securities').get().n)throw new Error('证券主表为空，请先同步Tushare，未调用模型');
-    const publishReady=async()=>{
+    let publicationChain=Promise.resolve();
+    const publishReady=()=>publicationChain=publicationChain.then(async()=>{
       if(!config.auto_publish)return;
       const published=await autoPublishReady(db,batch.id,{backupDir:dependencies.backupDir||'data/backups-v2'});
       context.log({stage:'auto_publish',batch_id:batch.id,published:published.published,blocked:published.blocked.length,backup:published.backup||null});
-    };
+    });
     await publishReady();
     // Resume paid primary work first. Never build an entire window of unreviewed work.
     await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted'),context);
@@ -425,17 +435,28 @@ export async function runAutomatedPipeline(db,options={},dependencies={}) {
       throw new Error('续跑复核存在校验失败，暂停后续付费调用，等待检查');
     const chunks=batchModelInputs(loadTopics(db,batch.id,'queued'),{maxItems:config.batch_size,maxChars:config.batch_chars,
       measure:t=>JSON.stringify(modelData(t)).length});
-    for(const chunk of chunks){
+    const processChunk=async(chunk)=>{
       context.check();
       db.prepare("UPDATE workflow_batches SET stage='primary',updated_at=? WHERE id=?").run(now(),batch.id);
       await executeStage(db,batch,config,'primary',chunk.items,context);
       db.prepare("UPDATE workflow_batches SET stage='review',updated_at=? WHERE id=?").run(now(),batch.id);
-      await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted'),context);
+      const topicIds=new Set(chunk.items.map(t=>t.topic_id));
+      await executeStage(db,batch,config,'review',loadTopics(db,batch.id,'extracted').filter(t=>topicIds.has(t.topic_id)),context);
       await publishReady();
       const failed=db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE batch_id=? AND status='failed'").get(batch.id).n;
       if(failed)throw new Error('当前小批存在校验失败，暂停后续付费调用，等待检查');
       context.log({stage:'checkpoint',batch_id:batch.id,counts:db.prepare('SELECT status,count(*) n FROM workflow_batch_topics WHERE batch_id=? GROUP BY status').all(batch.id)});
-    }
+    };
+    let nextChunk=0,failure=null;
+    const drain=async()=>{
+      while(!failure&&nextChunk<chunks.length){
+        const chunk=chunks[nextChunk++];
+        try{await processChunk(chunk);}catch(e){failure ||= e;context.abort=failure;}
+      }
+    };
+    // Keep the lease until every in-flight paid call has settled, even on failure.
+    await Promise.all(Array.from({length:config.concurrency||1},drain));
+    if(failure)throw failure;
     const counts=db.prepare('SELECT status,count(*) n FROM workflow_batch_topics WHERE batch_id=? GROUP BY status').all(batch.id);
     const unfinished=counts.some(r=>['queued','extracted','failed'].includes(r.status));
     const status=unfinished?'paused':counts.some(r=>r.status==='uncertain')?'completed_with_issues':'completed';

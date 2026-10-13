@@ -61,20 +61,29 @@ export function ensureAutomationSchema(db) {
 }
 
 const hasTable = (db, name) => !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name);
-export function dailyBudget(db, at = Date.now()) {
+export function budgetPolicy(batch){
+  const config=JSON.parse(batch.config_json);
+  const chars=config.daily_input_chars_limit??DAILY_LIMITS.max_input_chars;
+  if(!Number.isInteger(chars)||chars<1||chars>10000000)throw new Error('每日字符预算配置非法');
+  return {unlimitedCalls:config.unlimited_calls===true,maxInputChars:chars};
+}
+export function dailyBudget(db, at = Date.now(), policy={}) {
   const day = new Date(Number(at) + 8 * 3600000).toISOString().slice(0, 10);
   const start = new Date(`${day}T00:00:00+08:00`).toISOString();
   const end = new Date(Date.parse(start) + 86400000).toISOString();
   const used = hasTable(db, 'model_call_ledger') ? db.prepare(`SELECT count(*) calls_used,
     coalesce(sum(input_chars),0) input_chars_used FROM model_call_ledger WHERE started_at>=? AND started_at<?`).get(start,end)
     : { calls_used: 0, input_chars_used: 0 };
-  return { day, timezone: 'Asia/Shanghai', ...DAILY_LIMITS, ...used,
-    calls_remaining: Math.max(0, DAILY_LIMITS.max_calls-used.calls_used),
-    input_chars_remaining: Math.max(0, DAILY_LIMITS.max_input_chars-used.input_chars_used), resets_at: end };
+  const maxCalls=policy.unlimitedCalls?null:DAILY_LIMITS.max_calls;
+  const maxChars=policy.maxInputChars??DAILY_LIMITS.max_input_chars;
+  return { day, timezone: 'Asia/Shanghai', max_calls:maxCalls,max_input_chars:maxChars, ...used,
+    calls_remaining: maxCalls===null?null:Math.max(0, maxCalls-used.calls_used),
+    input_chars_remaining: Math.max(0, maxChars-used.input_chars_used), resets_at: end };
 }
 
 export function requireReviewCapacity(db, batchId) {
-  const batch = db.prepare('SELECT calls_used,max_calls FROM workflow_batches WHERE id=?').get(batchId);
+  const batch = db.prepare('SELECT * FROM workflow_batches WHERE id=?').get(batchId);
+  if(budgetPolicy(batch).unlimitedCalls)return;
   if(batch.max_calls-batch.calls_used<2 || dailyBudget(db).calls_remaining<2)
     throw Object.assign(new Error('剩余调用预算不足以完成识别和复核，保留待处理内容'), { code:'MODEL_BUDGET_EXCEEDED' });
 }
@@ -83,7 +92,9 @@ export function getAutomationStatus(db) {
     (SELECT max(finished_at) FROM ingestion_runs WHERE status='success') last_fetch_at FROM raw_topics`).get() : {};
   const batches = hasTable(db, 'workflow_batches') ? db.prepare(`SELECT id,status,stage,created_at,updated_at,window_start,window_end,
     selected_count,calls_used,input_chars_used,max_calls,max_input_chars,max_minutes,elapsed_ms,stop_requested,error,fetch_pages,fetch_complete,
-    heartbeat_at,lease_pid,json_extract(config_json,'$.auto_publish') auto_publish_enabled FROM workflow_batches ORDER BY id DESC LIMIT 20`).all().map(b => {
+    heartbeat_at,lease_pid,json_extract(config_json,'$.auto_publish') auto_publish_enabled,
+    json_extract(config_json,'$.unlimited_calls') unlimited_calls,
+    json_extract(config_json,'$.concurrency') concurrency FROM workflow_batches ORDER BY id DESC LIMIT 20`).all().map(b => {
       let alive=false; if(b.lease_pid)try{process.kill(b.lease_pid,0);alive=true;}catch(e){alive=e.code==='EPERM';}
       return {...b,worker_alive:alive,resumable:['paused','failed'].includes(b.status)||(b.status==='running'&&!alive),
         remaining_issues:db.prepare("SELECT count(*) n FROM workflow_topic_issues WHERE batch_id=? AND status='pending'").get(b.id).n,
@@ -92,12 +103,13 @@ export function getAutomationStatus(db) {
   const pending = hasTable(db, 'topic_processing_state') ? db.prepare(`SELECT count(*) n FROM raw_topics rt
     WHERE eligibility='eligible' AND published_at_utc>=? AND NOT EXISTS(SELECT 1 FROM topic_processing_state p
       WHERE p.topic_id=rt.topic_id AND p.content_hash=rt.content_hash AND p.status IN ('accepted','excluded','uncertain'))`).get(new Date(Date.now() - 168 * 3600000).toISOString()).n : 0;
-  const daily=dailyBudget(db);
+  const latest=batches[0]?db.prepare('SELECT config_json FROM workflow_batches WHERE id=?').get(batches[0].id):null;
+  const daily=dailyBudget(db,Date.now(),latest?budgetPolicy(latest):{});
   const autoPublishEvents=hasTable(db,'workflow_auto_publish_events')?db.prepare(`SELECT id,batch_id,status,published_count,blocked_json,backup_path,error,created_at
     FROM workflow_auto_publish_events ORDER BY id DESC LIMIT 10`).all():[];
   return { batches, latest_batch: batches[0] || null, coverage, pending_recent: pending, defaults: DEFAULT_LIMITS, daily_budget: daily,
     auto_publish_events:autoPublishEvents,
-    cost_note: `上海日期 ${daily.day} 全部批次合计：${daily.calls_used}/${daily.max_calls} 次调用、${daily.input_chars_used}/${daily.max_input_chars} 输入字符。CLI内部网络重试不可逐次计数，也不是美元账单。${batches[0]?.auto_publish_enabled?'自动发布已开启：仅独立审核与门禁通过的高置信观点，存疑留人工。':'自动发布未开启。'}预算达到后暂停，续跑不清零；尚未启用每日定时触发。` };
+    cost_note: `上海日期 ${daily.day} 全部批次合计：${daily.calls_used}/${daily.max_calls??'本批次不设次数上限'} 次调用、${daily.input_chars_used}/${daily.max_input_chars} 输入字符。CLI内部网络重试不可逐次计数，也不是美元账单。${batches[0]?.auto_publish_enabled?'自动发布已开启：仅独立审核与门禁通过的高置信观点，存疑留人工。':'自动发布未开启。'}预算达到后暂停，续跑不清零；尚未启用每日定时触发。` };
 }
 
 export function requestBatchStop(db, id) {
@@ -127,12 +139,13 @@ export function reserveCall(db, batchId, { stage, provider, model, chars, elapse
   try {
     const b = db.prepare('SELECT * FROM workflow_batches WHERE id=?').get(batchId);
     const stamp=now();
-    const daily = dailyBudget(db,Date.parse(stamp));
+    const policy=budgetPolicy(b);
+    const daily = dailyBudget(db,Date.parse(stamp),policy);
     let message = null;
     if (b.stop_requested) message = '用户请求暂停';
-    else if (daily.calls_remaining < 1) message = '已达到上海自然日跨批次模型调用上限';
+    else if (!policy.unlimitedCalls && daily.calls_remaining < 1) message = '已达到上海自然日跨批次模型调用上限';
     else if (chars > daily.input_chars_remaining) message = '已达到上海自然日跨批次模型输入字符上限';
-    else if (b.calls_used >= b.max_calls) message = '已达到本批次模型调用上限';
+    else if (!policy.unlimitedCalls && b.calls_used >= b.max_calls) message = '已达到本批次模型调用上限';
     else if (b.input_chars_used + chars > b.max_input_chars) message = '已达到本批次模型输入字符上限';
     else if (b.elapsed_ms + elapsedMs >= b.max_minutes * 60000) message = '已达到本批次累计运行时长上限';
     if (message) { const e = new Error(message); e.code = 'MODEL_BUDGET_EXCEEDED'; throw e; }

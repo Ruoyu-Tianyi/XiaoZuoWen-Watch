@@ -1,5 +1,5 @@
 import { runAutomatedPipeline } from './automated_pipeline.mjs';
-import { dailyBudget, ensureAutomationSchema } from './automation_state.mjs';
+import { dailyBudget, ensureAutomationSchema, budgetPolicy } from './automation_state.mjs';
 
 // One invocation drains small closed-loop chunks; never waits for a daily reset.
 // Reinvoking on another day resumes budget pauses without resetting paid usage.
@@ -17,21 +17,25 @@ export async function runRecentPipeline(db, options={}, dependencies={}) {
       error:'上批因非预算异常暂停，须检查后显式 --resume；不会自动重复付费',daily_budget:dailyBudget(db)};
   if(pending?.stop_requested)
     return {batch_id:pending.id,status:'paused',error:'已有人为停止请求，须显式 --resume',daily_budget:dailyBudget(db)};
-  const daily=dailyBudget(db);
-  if(daily.calls_remaining<2 || daily.input_chars_remaining<1)
+  const policy=pending?budgetPolicy(pending):{unlimitedCalls:false,maxInputChars:600000};
+  if(options.unlimitedCalls!=null)policy.unlimitedCalls=!!options.unlimitedCalls;
+  if(options.dailyMaxChars!=null)policy.maxInputChars=Number(options.dailyMaxChars);
+  const daily=dailyBudget(db,Date.now(),policy);
+  if((!policy.unlimitedCalls&&daily.calls_remaining<2) || daily.input_chars_remaining<1)
     return {batch_id:pending?.id||null,status:'paused',pause_code:'MODEL_BUDGET_EXCEEDED',
       error:'每日预算不足，未新建付费批次；下一次触发再检查预算',daily_budget:daily};
-  const calls=Math.min(Number(options.maxCalls??20),daily.calls_remaining);
+  const calls=policy.unlimitedCalls?0:Math.min(Number(options.maxCalls??20),daily.calls_remaining);
   const chars=Math.min(Number(options.maxChars??300000),daily.input_chars_remaining);
   const minutes=Number(options.maxMinutes??60);
-  if(!Number.isInteger(calls)||calls<2||!Number.isInteger(chars)||chars<1||!Number.isInteger(minutes)||minutes<1)
+  if((!policy.unlimitedCalls&&(!Number.isInteger(calls)||calls<2))||!Number.isInteger(chars)||chars<1||!Number.isInteger(minutes)||minutes<1)
     throw new Error('recent 运行预算必须为整数，调用数至少为2');
   const runOptions=pending?{resume:pending.id,batchSize:options.batchSize??10,prepareOnly:!!options.prepareOnly,
     reviewChars:options.reviewChars??40000,compactReview:true,
     autoPublish:options.autoPublish,
+    unlimitedCalls:policy.unlimitedCalls,dailyMaxChars:policy.maxInputChars,concurrency:options.concurrency,
     maxCalls:Number(pending.calls_used)+calls,maxChars:Number(pending.input_chars_used)+chars,
     maxMinutes:Math.ceil(Number(pending.elapsed_ms)/60000)+minutes}
     :{...options,windowEnd:end,hours:168,limit:options.limit??5000,batchSize:options.batchSize??10,
       maxCalls:calls,maxChars:chars,maxMinutes:minutes};
-  return {...await runAutomatedPipeline(db,runOptions,dependencies),daily_budget:dailyBudget(db)};
+  return {...await runAutomatedPipeline(db,runOptions,dependencies),daily_budget:dailyBudget(db,Date.now(),policy)};
 }

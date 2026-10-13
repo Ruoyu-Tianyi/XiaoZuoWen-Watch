@@ -599,6 +599,63 @@ test('Shanghai daily budget counts failed calls across batches and cannot be res
   assert.equal(dailyBudget(db,boundary).day,'2026-10-13');
 });
 
+test('explicit unlimited batch bypasses both call caps but does not exempt other batches',t=>{
+  const {db}=fixture(t),normal=createBatch(db,opts({maxCalls:100}));
+  for(let i=0;i<40;i++)reserveCall(db,normal.id,{stage:'primary',provider:'codex',model:'fixture-model',chars:1});
+  const unlimited=createBatch(db,opts({unlimitedCalls:true}));
+  assert.equal(unlimited.max_calls,0);
+  for(let i=0;i<45;i++)reserveCall(db,unlimited.id,{stage:'review',provider:'codex',model:'fixture-model',chars:1});
+  assert.equal(batchRow(db,unlimited.id).calls_used,45);
+  assert.throws(()=>reserveCall(db,normal.id,{stage:'review',provider:'codex',model:'fixture-model',chars:1}),/跨批次模型调用上限/);
+  assert.throws(()=>reserveCall(db,unlimited.id,{stage:'review',provider:'codex',model:'fixture-model',chars:600000}),/字符上限/);
+});
+
+test('recent entry can explicitly resume an unlimited batch after the usual daily call cap',async t=>{
+  const {db}=fixture(t),fake=fakeDependencies();
+  const prior=createBatch(db,opts({maxCalls:100}));
+  for(let i=0;i<40;i++)reserveCall(db,prior.id,{stage:'primary',provider:'codex',model:'fixture-model',chars:1});
+  const prepared=await runAutomatedPipeline(db,opts({prepareOnly:true}),fake.dependencies);
+  const result=await runRecentPipeline(db,{windowEnd:WINDOW_END,unlimitedCalls:true},fake.dependencies);
+  assert.equal(result.status,'completed',JSON.stringify(result));assert.equal(result.batch_id,prepared.batch_id);
+  assert.equal(result.daily_budget.max_calls,null);assert.equal(fake.calls.length,2);
+  assert.equal(batchRow(db,result.batch_id).calls_used,2);
+});
+
+test('raising explicit daily character budget keeps previous usage and does not change other batches',t=>{
+  const {db}=fixture(t),prior=createBatch(db,opts({maxChars:1000000}));
+  reserveCall(db,prior.id,{stage:'primary',provider:'codex',model:'fixture-model',chars:600000});
+  const current=createBatch(db,opts({unlimitedCalls:true,maxChars:1000000,dailyMaxChars:1000000}));
+  reserveCall(db,current.id,{stage:'review',provider:'codex',model:'fixture-model',chars:100000});
+  assert.equal(dailyBudget(db).input_chars_used,700000);
+  assert.throws(()=>reserveCall(db,prior.id,{stage:'review',provider:'codex',model:'fixture-model',chars:1}),/字符上限/);
+});
+
+test('two fast workers process distinct chunks and serialize publication without duplicate paid calls',async t=>{
+  const {db,directory}=fixture(t);let active=0,maxActive=0;
+  const fake=fakeDependencies({topics:Array.from({length:4},(_,i)=>source({topic_id:String(600000000+i),content:`${BODY}并发样本${i}`})),
+    transform:async({result})=>{active++;maxActive=Math.max(maxActive,active);await new Promise(r=>setTimeout(r,15));active--;return result;}});
+  const result=await runAutomatedPipeline(db,opts({unlimitedCalls:true,concurrency:2,batchSize:1,autoPublish:true}),{...fake.dependencies,backupDir:join(directory,'backups')});
+  assert.equal(result.status,'completed',JSON.stringify(result));assert.equal(maxActive,2);
+  assert.equal(fake.calls.length,8);
+  assert.equal(new Set(fake.calls.map(c=>c.stage+':'+c.topicIds.join(','))).size,8);
+  assert.equal(db.prepare("SELECT count(*) n FROM viewpoints WHERE review_status='published'").get().n,4);
+  assert.equal(db.prepare("SELECT count(*) n FROM model_call_ledger WHERE status='running'").get().n,0);
+});
+
+test('fast worker failure waits for in-flight calls before releasing lease or closing the run',async t=>{
+  const {db}=fixture(t);
+  const fake=fakeDependencies({topics:[source({topic_id:'600000001'}),source({topic_id:'600000002',content:`${BODY}另一篇`})],
+    transform:async({inputs,result})=>{
+      await new Promise(r=>setTimeout(r,inputs[0].topic_id==='600000001'?5:40));
+      if(inputs[0].topic_id==='600000001')result.items[0].topic_id='invalid';return result;
+    }});
+  const result=await runAutomatedPipeline(db,opts({unlimitedCalls:true,concurrency:2,batchSize:1}),fake.dependencies);
+  assert.equal(result.status,'paused');assert.equal(fake.calls.length,2);
+  assert.equal(batchRow(db,result.batch_id).lease_token,null);
+  assert.equal(db.prepare("SELECT count(*) n FROM model_call_ledger WHERE status='running'").get().n,0);
+  assert.equal(db.prepare("SELECT count(*) n FROM workflow_batch_topics WHERE status='extracted'").get().n,1);
+});
+
 test('daily input character cap is atomic and independent of per-batch caps',t=>{
   const {db}=fixture(t),first=createBatch(db,opts()),second=createBatch(db,opts());
   db.prepare('UPDATE workflow_batches SET max_input_chars=1000000').run();
